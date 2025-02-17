@@ -8,11 +8,15 @@ assemblies_path: "config/assemblies.tsv"
 # - "balanced_v1": recipe used in original paper
 # - "non_blacklist": uses my custom beds to remove blacklisted regions 
 # - "feature_and_promoter_only": a chosen feature plus, promoter regions
-target_intervals: "non_blacklist"
+# - "only_promoter_intervals": only promoter regions using mRNA. currently using 1000bp upstream and downstream
+target_intervals: "only_promoter_intervals"
 
 window_size: 512
 step_size: 256
 add_rc: True
+
+promoter_upstream: 1000
+promoter_downstream: 1000
 
 ## I am setting whole chromosomes to test and validation, everything else is training
 # chroms will be randomly assigned to splits

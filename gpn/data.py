@@ -396,7 +396,7 @@ def get_balanced_intervals(
     return intervals
 
 def get_only_feature_and_promoter_intervals(
-    defined_intervals, annotation, window_size, promoter_upstream=1000
+    defined_intervals, annotation, window_size, promoter_upstream=1000, promoter_downstream=0
 ):
     # there's the issue of pseudogenes though... should be aware
     exons = add_flank(get_annotation_features(annotation, "exon"), window_size // 10)
@@ -406,6 +406,22 @@ def get_only_feature_and_promoter_intervals(
     )
     print("promoters: ", intervals_size(promoters) / intervals_size(defined_intervals), flush=True)
     intervals = union_intervals(exons, promoters)
+    intervals = intersect_intervals(add_jitter(intervals, 50), defined_intervals)
+    # in case they collide with undefined intervals
+    intervals = filter_length(intervals, window_size)
+    print("intervals: ", intervals_size(intervals) / intervals_size(defined_intervals), flush=True)
+    print((intervals.end - intervals.start).min())
+    assert (intervals.end - intervals.start).min() >= window_size
+    return intervals
+
+def get_only_promoter_intervals(
+    defined_intervals, annotation, window_size, promoter_upstream=1000, promoter_downstream=0
+):
+    # there's the issue of pseudogenes though... should be aware
+    promoters = add_flank(
+        get_promoters(annotation, promoter_upstream, promoter_downstream), window_size // 10
+    )
+    print("promoters: ", intervals_size(promoters) / intervals_size(defined_intervals), flush=True)
     intervals = intersect_intervals(add_jitter(intervals, 50), defined_intervals)
     # in case they collide with undefined intervals
     intervals = filter_length(intervals, window_size)

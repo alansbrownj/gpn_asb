@@ -1,6 +1,7 @@
 from gpn.data import (
     Genome, load_table, get_balanced_intervals, filter_length,
     filter_annotation_features, get_only_feature_and_promoter_intervals,
+    get_only_promoter_intervals,
 )
 
 whitelist_gff = config["whitelist_annotation_file"]
@@ -125,7 +126,7 @@ rule make_balanced_v1_intervals:
         )
         intervals.to_parquet(output[0], index=False)
 
-rule make_only_feature_and_promoter_intervals_intervals:
+rule make_only_feature_and_promoter_intervals:
     input:
         "results/intervals/{assembly}/non_blacklist.parquet",
         "results/annotation/{assembly}.gff.gz",
@@ -137,6 +138,23 @@ rule make_only_feature_and_promoter_intervals_intervals:
         intervals = get_only_feature_and_promoter_intervals(
             defined_intervals, annotation, config["window_size"],
             config.get("promoter_upstream", 1000),
+            config.get("promoter_downstream", 1000),
+        )
+        intervals.to_parquet(output[0], index=False)
+
+rule make_only_promoter_intervals:
+    input:
+        "results/intervals/{assembly}/non_blacklist.parquet",
+        "results/annotation/{assembly}.gff.gz",
+    output:
+        "results/intervals/{assembly}/only_promoter_intervals.parquet",
+    run:
+        defined_intervals = load_table(input[0])
+        annotation = load_table(input[1])
+        intervals = get_only_promoter_intervals(
+            defined_intervals, annotation, config["window_size"],
+            config.get("promoter_upstream", 1000),
+            config.get("promoter_downstream", 1000)
         )
         intervals.to_parquet(output[0], index=False)
 
