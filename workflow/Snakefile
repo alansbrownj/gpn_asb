@@ -1,0 +1,25 @@
+import pandas as pd
+
+configfile: "config/config.yaml"
+# print(config)
+
+assemblies = pd.read_csv(config["assemblies_path"], sep="\t", index_col=0)
+training_assemblies = [
+    a for a in assemblies.index
+    if a not in (config["whitelist_test_hold_out"] + config["whitelist_validation_hold_out"])
+]
+splits = ["train", "validation", "test"]
+target_intervals = config["target_intervals"]
+
+# comment out if you have your own fasta files
+# and make sure you have genomes (and annotations, if applicable) in the right place
+# results/genome/{assembly}.fa.gz (and results/annotation/{assembly}.gff.gz)
+include: "rules/download.smk"
+include: "rules/intervals.smk"
+include: "rules/dataset.smk"
+
+
+rule all:
+    input:
+        expand("results/dataset/{intervals}/data/{split}", split=splits, intervals=target_intervals),
+        # expand("results/intervals/{assembly}/non_blacklist.csv", assembly=assemblies.index),
