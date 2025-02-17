@@ -1,0 +1,52 @@
+Assembly Accession	Assembly Name	Organism Name	Organism Infraspecific Names Breed	Organism Infraspecific Names Strain	Organism Infraspecific Names Cultivar	Organism Infraspecific Names Ecotype	Organism Infraspecific Names Isolate	Organism Infraspecific Names Sex	Annotation Name	Assembly Level	Assembly Release Date	WGS project accession	Assembly Stats Number of Scaffolds
+GCF_000002765.6	GCA_000002765	Plasmodium falciparum 3D7					3D7		Annotation submitted by Plasmodium falciparum Genome Sequencing Consortium	Complete Genome	2016-04-07		14
+GCF_900002385.2	GCA_900002385	Plasmodium yoelii		17X					Annotation submitted by WTSI	Complete Genome	2019-06-04		14
+GCF_000740895.1	ASM74089v1	Theileria orientalis strain Shintoku		Shintoku					Annotation submitted by NCBI RefSeq	Complete Genome	2012-09-05		4
+GCF_900681995.1	PVVCY_v1	Plasmodium vinckei vinckei							Annotation submitted by KAUST	Complete Genome	2019-01-30		14
+GCF_000208865.1	ASM20886v2	Neospora caninum Liverpool		Liverpool					Annotation submitted by Wellcome Trust Sanger Institute	Chromosome	2011-03-02		14
+GCF_000691945.2	ASM69194v2	Babesia microti strain RI		RI					Annotation submitted by Centre National de Sequencage GENOSCOPE	Chromosome	2015-07-30		4
+GCF_001680005.1	ASM168000v1	Plasmodium coatneyi		Hackeri					Annotation submitted by NCBI RefSeq	Chromosome	2016-07-06		14
+GCF_000006565.2	TGA4	Toxoplasma gondii ME49		ME49					Annotation submitted by NCBI RefSeq	Chromosome	2013-08-02	ABPA02	2276
+GCF_000002415.2	ASM241v2	Plasmodium vivax		Salvador I			Salvador I		Annotation submitted by TIGR	Chromosome	2009-05-06	AAKM01	2747
+GCF_900002375.2	GCA_900002375	Plasmodium berghei ANKA		ANKA					Annotation submitted by WTSI	Chromosome	2019-06-14	CABFNT01	19
+GCF_000165345.1	ASM16534v1	Cryptosporidium parvum Iowa II					Iowa type II		Annotation submitted by NCBI RefSeq	Chromosome	2007-02-26	AAEE01	8
+GCF_000165395.2	ASM16539v2	Babesia bovis T2Bo		T2Bo					Annotation submitted by The J. Craig Venter Institute	Chromosome	2021-05-26	AAXT02	6
+GCF_000006355.2	GCA_000006355.2	Plasmodium knowlesi strain H		H					Annotation submitted by Wellcome Trust Sanger Institute	Chromosome	2020-02-24	CADCXE01	162
+GCF_000165365.1	ASM16536v1	Theileria parva strain Muguga		Muguga					Annotation submitted by TIGR	Chromosome	2005-06-30	AAGK01	8
+GCF_000981445.1	Bbig001	Babesia bigemina		Bond					Annotation submitted by NCBI RefSeq	Chromosome	2014-06-13		483
+GCF_000003225.4	ASM322v1	Theileria annulata		Ankara isolate clone C9					Annotation submitted by The Sanger Institute	Chromosome	2005-07-29		7
+GCF_001601855.1	ASM160185v1	Plasmodium reichenowi		SY57					Annotation submitted by NCBI RefSeq	Chromosome	2016-04-08	LVLA01	776
+GCF_000342415.1	JCVI-bewag-v1.1	Theileria equi strain WA		WA					Annotation submitted by J. Craig Venter Institute	Chromosome	2012-12-11	ACOU01	10
+GCF_002563875.1	Bbes1.0	Besnoitia besnoiti		Bb-Ger1					Annotation submitted by Hernan Lorenzi	Chromosome	2017-10-18	NWUJ01	185
+GCF_023973825.1	ASM2397382v1	Plasmodium brasilianum		Bolivian I					Annotation submitted by Centers for Disease Control and Prevention	Chromosome	2022-06-29	JAMQJU01	43
+GCF_028658345.1	Bduncani_v1	Babesia duncani					WA1		Annotation submitted by University of California	Chromosome	2023-02-21	JALLKP01	165
+GCF_000321355.1	PcynB_1.0	Plasmodium cynomolgi strain B		B					Annotation submitted by NCBI RefSeq	Chromosome	2012-06-07	BAEJ01	1663
+GCF_900005765.1	PRELSG	Plasmodium relictum		SGS1					Annotation submitted by WTSI	Chromosome	2016-11-17	CVMU01	512
+GCF_001602025.1	ASM160202v1	Plasmodium gaboni		SY75					Annotation submitted by NCBI RefSeq	Chromosome	2016-04-08	LVLB01	832
+GCF_900090045.1	PmUG01	Plasmodium malariae							Annotation submitted by WTSI	Chromosome	2016-12-13	FLRL01	61
+GCF_900097015.1	PADLG01	Plasmodium sp. gorilla clade G2							Annotation submitted by WTSI	Chromosome	2018-03-27	OEYY01	82
+GCF_000006425.1	ASM642v1	Cryptosporidium hominis TU502		TU502					Annotation submitted by NCBI RefSeq	Scaffold	2004-10-27	AAEL01	1422
+GCF_002157705.1	Pgonderi_assembly01	Plasmodium gonderi		ATCC 30045					Annotation submitted by Osaka University	Scaffold	2017-05-17	BDQF01	741
+GCF_000499545.2	ETH001	Eimeria tenella		Houghton					Annotation submitted by SC	Scaffold	2013-11-06	CBUW01	4664
+GCF_002999335.1	CcayRef3	Cyclospora cayetanensis					NF1_C8		NCBI Cyclospora cayetanensis Annotation Release 100	Contig	2018-03-14	PVNT01	
+GCF_000499425.1	EAH001	Eimeria acervulina		Houghton					Annotation submitted by NCBI RefSeq	Scaffold	2013-11-05	CBUS01	3415
+GCF_000499605.1	EMW001	Eimeria maxima		Weybridge					Annotation submitted by NCBI RefSeq	Scaffold	2013-11-06	CBUY01	3564
+GCF_900005855.1	PGAL8A	Plasmodium gallinaceum		8A					Annotation submitted by WTSI	Scaffold	2016-11-18	CVMV01	152
+GCF_000499385.1	ENH001	Eimeria necatrix		Houghton					Annotation submitted by NCBI RefSeq	Scaffold	2013-11-06	CBUZ01	3707
+GCF_000006515.1	JCVI_cmg_v1.0	Cryptosporidium muris RN66		RN66					Annotation submitted by TIGR	Scaffold	2008-07-23	AAZY02	84
+GCF_024862765.1	Bcaballi_D6B2_v1.0	Babesia caballi					USDA-D6B2		Annotation submitted by Research Center for Zoonosis Control, Hokkaido university	Contig	2022-07-23	BPLF01	
+GCF_001865345.1	ASM186534v1	Cryptosporidium ubiquitum					39726		Annotation submitted by CDC	Scaffold	2016-11-03	LRBP01	39
+GCF_002600585.1	ASM260058v1	Cystoisospora suis		Wien I					Annotation submitted by Institute of Parasitology - Vetmeduni Vienna	Scaffold	2017-10-20	MIGC01	14627
+GCF_000223845.1	GNI3	Gregarina niphandrodes							Annotation submitted by NCBI RefSeq	Scaffold	2014-04-11	AFNH02	469
+GCF_000499745.2	EMH001	Eimeria mitis		Houghton					Annotation submitted by WTSI	Scaffold	2013-11-06	CBUT01	15978
+GCF_002897235.1	Bovata_7.1	Babesia ovata		Miyake					Annotation submitted by Research Center for Zoonosis Control, Hokkaido univ	Contig	2017-12-15	BDSA01	
+GCF_009768925.1	ASM976892v2	Cryptosporidium bovis					45015		Annotation submitted by South China Agricultural University	Scaffold	2021-11-10	VHIT02	55
+GCF_002095265.1	B_xinjiang1.0	Babesia sp. Xinjiang		Xinjiang					Annotation submitted by University of Melbourne	Scaffold	2017-04-18	MBFZ01	215
+GCF_004936735.1	CCh_genotype_I	Cryptosporidium sp. chipmunk genotype I		37763					Annotation submitted by South China Agricultural University	Scaffold	2021-12-30	SCFC02	50
+GCF_009792415.1	ASM979241v2	Cryptosporidium ryanae					45019		Annotation submitted by South China Agricultural University	Scaffold	2022-01-06	VHLK02	93
+GCF_001865355.1	ASM186535v1	Cryptosporidium andersoni					30847		Annotation submitted by Centers for Disease Control and Prevention	Scaffold	2016-11-03	LRBS01	135
+GCF_000524495.1	Plas_inui_San_Antonio_1_V1	Plasmodium inui San Antonio 1		San Antonio 1					Annotation submitted by NCBI RefSeq	Scaffold	2014-01-31	AMYR01	323
+GCF_019968985.1	MNHN_PgigB_v1.1	Porospora cf. gigantea B					B		Annotation submitted by Museum national d'Histoire naturelle	Scaffold	2021-09-14	JAHYSF01	918
+GCF_000956335.1	Plas_frag_nilgiri_V1	Plasmodium fragile		nilgiri					Annotation submitted by Broad Institute	Scaffold	2015-03-20	JOOM01	247
+GCF_019968955.1	MNHN_PgigA_v1	Porospora cf. gigantea A					A		Annotation submitted by Museum national d'Histoire naturelle	Scaffold	2021-09-14	JAHYSE01	787
+GCF_900002335.3	GCA_900002335	Plasmodium chabaudi chabaudi		AS					Annotation submitted by WTSI	Chromosome	2019-06-04		14

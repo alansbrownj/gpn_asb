@@ -1,0 +1,48 @@
+# assumes the first column contains the assembly name
+assemblies_path: "config/assemblies.tsv"
+
+# Intervals from fasta file used for training:
+# - "all": all positions
+# - "defined": positions with defined nucleotides (not N)
+# - "annotation_{feature}": only <feature> positions from annotation, e.g. CDS, exon
+# - "balanced_v1": recipe used in original paper
+# - "non_blacklist": uses my custom beds to remove blacklisted regions 
+# - "feature_and_promoter_only": a chosen feature plus, promoter regions
+target_intervals: "non_blacklist"
+
+window_size: 512
+step_size: 256
+add_rc: True
+
+## I am setting whole chromosomes to test and validation, everything else is training
+# chroms will be randomly assigned to splits
+# split_proportion:
+#   train: 0.99
+#   validation: 0.005
+#   test: 0.005
+
+# GCF_000002765.6 is P. falciparum 3D7
+whitelist_annotation_file: "GCF_000002765.6.gff.gz"
+
+# GCF_000002765.6 is P. falciparum 3D7
+whitelist_assemblies:
+  - chr14_NC_037283.1.fa.gz
+  - chr13_NC_004331.3.fa.gz
+
+whitelist_validation_hold_out:
+- "chr13_NC_004331.3.fa.gz"  # Plasmodium falciparum 3D7 chr 13
+
+whitelist_test_hold_out:
+- "chr14_NC_037283.1.fa.gz"  # Plasmodium falciparum 3D7 chr 14
+
+# this chroms are forced to be in validation set
+whitelist_validation_chroms:
+- "NC_004331.3"  # Plasmodium falciparum 3D7 chr 13
+# this chroms are forced to be in test set
+whitelist_test_chroms:
+- "NC_037283.1"  # Plasmodium falciparum 3D7 chr 14
+
+# We want to split data into shards of e.g. ~100MB each
+# It's good to have at least num_cpus shards to increase parallel loading speed
+# of iterable datasets from HF hub
+samples_per_file: 500_000 
