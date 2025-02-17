@@ -87,37 +87,78 @@ def load_repeatmasker(path):
 
 
 class Genome:
-    def __init__(self, path, subset_chroms=None):
-        self._genome = load_fasta(path, subset_chroms=subset_chroms)
-        self.chrom_sizes = {chrom: len(seq) for chrom, seq in self._genome.items()}
+    def __init__(self, path, subset_chroms=None, blacklist_path=None):
+        """
+        Initializes the Genome class.
 
-    def get_seq(self, chrom, start, end, strand="+"):
-        chrom_size = self.chrom_sizes[chrom]
-        seq = self._genome[chrom][max(start,0):min(end,chrom_size)]
+        Parameters:
+        - path: Path to the genome FASTA file.
+        - subset_chroms: List of chromosomes to include (default is None, meaning all chromosomes).
+        - blacklist_path: Path to a BED file with regions to exclude from the genome.
+        """
+        self._genome = self.load_fasta(path, subset_chroms=subset_chroms)
+        self.blacklist_intervals = self.load_blacklist(blacklist_path) if blacklist_path else None
 
-        if start < 0: seq = "N" * (-start) + seq  # left padding
-        if end > chrom_size: seq = seq + "N" * (end - chrom_size)  # right padding
+    @staticmethod
+    def load_fasta(path, subset_chroms=None):
+        with gzip.open(path, "rt") if path.endswith(".gz") else open(path) as handle:
+            genome = pd.Series(
+                {
+                    rec.id: str(rec.seq)
+                    for rec in SeqIO.parse(handle, "fasta")
+                    if subset_chroms is None or rec.id in subset_chroms
+                }
+            )
+        return genome
 
-        if strand == "-":
-            seq = str(Seq(seq).reverse_complement())
-        return seq
+    @staticmethod
+    def load_blacklist(path):
+        """
+        Loads a blacklist BED file.
 
-    def get_nuc(self, chrom, pos, strand="+"):
-        # pos is assumed to be 1-based as in VCF
-        seq = self._genome[chrom][pos - 1]
-        if strand == "-":
-            seq = str(Seq(seq).reverse_complement())
-        return seq
+        Parameters:
+        - path: Path to the BED file.
 
-    def filter_chroms(self, chroms):
-        self._genome = self._genome[chroms]
+        Returns:
+        - A DataFrame with columns ['chrom', 'start', 'end'], or None if the file is empty.
+        """
+        if path:
+            df = bf.read_table(path, schema="bed")
+            if df.empty:
+                return None
+            return df
+        return None
 
-    def get_seq_fwd_rev(self, chrom, start, end):
-        seq_fwd = self.get_seq(chrom, start, end)
-        seq_rev = str(Seq(seq_fwd).reverse_complement())
-        return seq_fwd, seq_rev
+
+    def get_non_blacklist_intervals(self):
+        """
+        Get intervals that exclude blacklist regions.
+
+        Returns:
+        - A DataFrame of intervals not overlapping with blacklist regions, or all intervals if the blacklist is None.
+        """
+        all_intervals = self.get_all_intervals()
+        if self.blacklist_intervals is not None:
+            return bf.subtract(all_intervals, self.blacklist_intervals)
+        return all_intervals
+
+    
+    def update_blacklist(self, blacklist_path):
+            """
+            Update the blacklist intervals with a new path.
+
+            Parameters:
+            - blacklist_path: Path to a BED file with regions to exclude.
+            """
+            self.blacklist_intervals = self.load_blacklist(blacklist_path)
 
     def get_all_intervals(self):
+        """
+        Get all intervals for the genome.
+
+        Returns:
+        - A DataFrame with columns ['chrom', 'start', 'end'].
+        """
         return pd.DataFrame(
             [
                 {"chrom": chrom, "start": 0, "end": len(seq)}
@@ -125,7 +166,31 @@ class Genome:
             ]
         )
 
-    def get_intervals_matching_symbols(self, symbols):
+    def get_seq(self, chrom, start, end, strand="+"):
+        """
+        Extracts a sequence from the genome.
+
+        Parameters:
+        - chrom: Chromosome name.
+        - start: Start position (0-based).
+        - end: End position (0-based, exclusive).
+        - strand: '+' or '-' for forward or reverse strand.
+
+        Returns:
+        - The sequence as a string.
+        """
+        seq = self._genome[chrom][start:end]
+        if strand == "-":
+            seq = str(Seq(seq).reverse_complement())
+        return seq
+
+    def get_defined_intervals(self):
+        """
+        Returns intervals of the genome containing defined symbols (e.g., ACGT).
+
+        Returns:
+        - A DataFrame with columns ['chrom', 'start', 'end'].
+        """
         def get_intervals_matching_symbols_chrom(chrom):
             complete_interval = pd.DataFrame(
                 {"chrom": [chrom.name], "start": [0], "end": [len(chrom.seq)]}
@@ -135,7 +200,7 @@ class Genome:
                     start=np.where(
                         ~np.isin(
                             np.frombuffer(chrom.seq.encode("ascii"), dtype="S1"),
-                            symbols,
+                            np.frombuffer("ACGTacgt".encode("ascii"), dtype="S1"),
                         )
                     )[0]
                 )
@@ -217,6 +282,7 @@ def add_jitter(intervals, magnitude, seed=42):
     # After using this function, we recommend intersecting with
     # Genome.get_all_intervals(), to avoid getting out of chromosome bounds
     # or smaller subsets such as Genome.get_defined_intervals()
+    # asb: If I did it right, intersect with a whitelist set of intervals
     rng = np.random.default_rng(seed)
     jitter = rng.integers(-magnitude, magnitude, size=len(intervals), endpoint=True)
     new_intervals = intervals.copy()
@@ -304,16 +370,16 @@ def get_balanced_intervals(
 ):
     # there's the issue of pseudogenes though... should be aware
     exons = add_flank(get_annotation_features(annotation, "exon"), window_size // 2)
-    print("exons: ", intervals_size(exons) / intervals_size(defined_intervals))
+    print("exons: ", intervals_size(exons) / intervals_size(defined_intervals), flush=True)
     promoters = add_flank(
         get_promoters(annotation, promoter_upstream), window_size // 2
     )
-    print("promoters: ", intervals_size(promoters) / intervals_size(defined_intervals))
+    print("promoters: ", intervals_size(promoters) / intervals_size(defined_intervals), flush=True)
     intervals = union_intervals(exons, promoters)
     intervals = intersect_intervals(add_jitter(intervals, 100), defined_intervals)
     # in case they collide with undefined intervals
     intervals = filter_length(intervals, window_size)
-    print("intervals: ", intervals_size(intervals) / intervals_size(defined_intervals))
+    print("intervals: ", intervals_size(intervals) / intervals_size(defined_intervals), flush=True)
     # maybe add a 0.5 factor
     n_random_intervals = intervals_size(intervals) // window_size
     random_intervals = get_random_intervals(
@@ -321,14 +387,32 @@ def get_balanced_intervals(
     )
     print(
         "random_intervals: ",
-        intervals_size(random_intervals) / intervals_size(defined_intervals),
+        intervals_size(random_intervals) / intervals_size(defined_intervals), flush=True,
     )
     intervals = union_intervals(intervals, random_intervals)
-    print("intervals: ", intervals_size(intervals) / intervals_size(defined_intervals))
+    print("intervals: ", intervals_size(intervals) / intervals_size(defined_intervals), flush=True)
     print((intervals.end - intervals.start).min())
     assert (intervals.end - intervals.start).min() >= window_size
     return intervals
 
+def get_only_feature_and_promoter_intervals(
+    defined_intervals, annotation, window_size, promoter_upstream=1000
+):
+    # there's the issue of pseudogenes though... should be aware
+    exons = add_flank(get_annotation_features(annotation, "exon"), window_size // 10)
+    print("exons: ", intervals_size(exons) / intervals_size(defined_intervals), flush=True)
+    promoters = add_flank(
+        get_promoters(annotation, promoter_upstream), window_size // 10
+    )
+    print("promoters: ", intervals_size(promoters) / intervals_size(defined_intervals), flush=True)
+    intervals = union_intervals(exons, promoters)
+    intervals = intersect_intervals(add_jitter(intervals, 50), defined_intervals)
+    # in case they collide with undefined intervals
+    intervals = filter_length(intervals, window_size)
+    print("intervals: ", intervals_size(intervals) / intervals_size(defined_intervals), flush=True)
+    print((intervals.end - intervals.start).min())
+    assert (intervals.end - intervals.start).min() >= window_size
+    return intervals
 
 def make_windows(intervals, window_size, step_size, add_rc=False):
     return pd.concat(
@@ -400,7 +484,7 @@ class GenomeMSA(object):
             chroms = [chrom for chrom in chroms if chrom in subset_chroms]
         if in_memory:
             self.data = pd.Series({chrom: self.f[chrom][:] for chrom in tqdm(chroms)})
-            #self.f.close()
+            self.f.close()
         else:
             # pd.Series does not work with h5py/zarr object
             # (attempts to load all data into memory)
@@ -409,7 +493,7 @@ class GenomeMSA(object):
         print("Loading MSA... Done")
 
     def get_msa(self, chrom, start, end, strand="+", tokenize=False):
-        msa = self.data[chrom][start:end].view("S1")
+        msa = self.data[chrom][start:end]
         if strand == "-":
             msa = self.reverse_complementer(msa, position_axis=0)
         if tokenize:
@@ -475,7 +559,7 @@ class GenomeMSA(object):
         return msa_batch_fwd, msa_batch_rev
 
     def run_vep(self, chrom, pos, ref, alt, pseudocounts=1):
-        msa = np.char.upper(self.data[chrom][pos - 1].view("S1"))
+        msa = np.char.upper(self.data[chrom][pos - 1])
         assert msa[0] == ref.encode("ascii"), f"{ref=} does not match {msa[0]=}"
         msa = msa[1:]  # exclude target species
         ref_count = (msa == ref.encode("ascii")).sum() + pseudocounts
@@ -499,12 +583,12 @@ class GenomeMSA(object):
         elif backend == "joblib":
             vep_batch = Parallel(n_jobs=n_jobs)(
                 delayed(_run_vep)(i, chroms, poss, refs, alts, self, kwargs)
-                for i in tqdm(range(len(chroms)))
+                for i in range(len(chroms))
             )
         elif backend is None:
             vep_batch = [
                 _run_vep(i, chroms, poss, refs, alts, self, kwargs)
-                for i in tqdm(range(len(chroms)))
+                for i in range(len(chroms))
             ]
         return np.array(vep_batch)
 
