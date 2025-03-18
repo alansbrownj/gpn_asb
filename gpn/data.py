@@ -422,7 +422,7 @@ def get_only_promoter_intervals(
         get_promoters(annotation, promoter_upstream, promoter_downstream), window_size // 10
     )
     print("promoters: ", intervals_size(promoters) / intervals_size(defined_intervals), flush=True)
-    intervals = intersect_intervals(add_jitter(intervals, 50), defined_intervals)
+    intervals = intersect_intervals(add_jitter(promoters, 50), defined_intervals)
     # in case they collide with undefined intervals
     intervals = filter_length(intervals, window_size)
     print("intervals: ", intervals_size(intervals) / intervals_size(defined_intervals), flush=True)

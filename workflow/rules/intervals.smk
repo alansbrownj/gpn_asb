@@ -154,7 +154,7 @@ rule make_only_promoter_intervals:
         intervals = get_only_promoter_intervals(
             defined_intervals, annotation, config["window_size"],
             config.get("promoter_upstream", 1000),
-            config.get("promoter_downstream", 1000)
+            config.get("promoter_downstream", 1000),
         )
         intervals.to_parquet(output[0], index=False)
 
