@@ -35,6 +35,7 @@ import datasets
 from datasets import load_dataset, DatasetDict, concatenate_datasets
 
 # import evaluate
+## Adding EarlyStoppingCallback -- 2025-03-18 Tuesday W12.2
 import transformers
 from transformers import (
     CONFIG_MAPPING,
@@ -45,6 +46,7 @@ from transformers import (
     DataCollatorForLanguageModeling,
     HfArgumentParser,
     Trainer,
+    EarlyStoppingCallback,
     TrainingArguments,
     is_torch_tpu_available,
     set_seed,
@@ -510,13 +512,15 @@ def main():
     )
 
     # Initialize our Trainer
+    ## Adding early stopping on 2025-03-18 Tuesday W12.2
     trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset if training_args.do_train else None,
-        eval_dataset=eval_dataset if training_args.do_eval else None,
-        tokenizer=tokenizer,
-        data_collator=data_collator,
+    model=model,
+    args=training_args,
+    train_dataset=train_dataset if training_args.do_train else None,
+    eval_dataset=eval_dataset if training_args.do_eval else None,
+    tokenizer=tokenizer,
+    data_collator=data_collator,
+    callbacks=[EarlyStoppingCallback(early_stopping_patience=3)]
     )
 
     # Training
