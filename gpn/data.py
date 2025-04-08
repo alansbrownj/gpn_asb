@@ -222,9 +222,9 @@ class Genome:
             .values,
             ignore_index=True,
         )
-
-    def get_defined_intervals(self):
-        return self.get_intervals_matching_symbols(DEFINED_SYMBOLS)
+    # the below seems to be a duplicate and can be removed. 
+    # def get_defined_intervals(self):
+    #     return self.get_intervals_matching_symbols(DEFINED_SYMBOLS)
 
     def get_unmasked_intervals(self):
         return self.get_intervals_matching_symbols(UNMASKED_SYMBOLS)
