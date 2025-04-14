@@ -220,7 +220,6 @@ CLASSIFICATION_HEAD_CLASS = {
     "lightweight_cnn": LightweightCNNClassificationHead,
 }
 
-
 class GPNConfig(RoFormerConfig):
     model_type = "GPN"
 
@@ -433,6 +432,7 @@ class GPNForSequenceClassification(GPNPreTrainedModel):
             loss=loss,
             logits=logits,
         )
+
 
 
 class GPNForTokenClassification(GPNPreTrainedModel):
