@@ -35,7 +35,6 @@ from transformers import (
     AutoConfig,
     AutoModelForSequenceClassification,
     AutoTokenizer,
-    DataCollatorForLanguageModeling,
     HfArgumentParser,
     Trainer,
     EarlyStoppingCallback,
@@ -53,7 +52,8 @@ from Bio.Seq import Seq
 import gpn.model
 import pandas as pd
 from scipy.stats import geom
-from torch.utils.data import DataLoader, IterableDataset, get_worker_info, ConcatDataset, WeightedRandomSampler, Dataset
+# from torch.utils.data import DataLoader, IterableDataset, get_worker_info, ConcatDataset, WeightedRandomSampler, Dataset
+from torch.utils.data import ConcatDataset, WeightedRandomSampler, Dataset
 from tqdm import tqdm
 
 ## These imports are *mostly* the same as the run_mlm.py script. 
@@ -238,22 +238,6 @@ class DataTrainingArguments:
 
 # ----- Main training function ----- #
 def main():
-    # parser = argparse.ArgumentParser(description="Run GPN-based Sequence Classification")
-    # parser.add_argument("--datadir", type=str, required=True, help="Path to the data directory")
-    # parser.add_argument("--output_dir", type=str, required=True, help="Directory to save the model")
-    # parser.add_argument("--model_type", type=str, default="ConvNet",
-    #                     help="Model type to use when training from scratch (e.g., ConvNet, bytenet, roformer)")
-    # parser.add_argument("--model_name_or_path", type=str, default=None, help="Pre-trained model path")
-    # parser.add_argument("--tokenizer_name", type=str, required=True, help="Tokenizer name/path")
-    # parser.add_argument("--max_length", type=int, default=512, help="Max sequence length")
-    # parser.add_argument("--per_device_train_batch_size", type=int, default=128)
-    # parser.add_argument("--learning_rate", type=float, default=1e-3)
-    # parser.add_argument("--num_train_epochs", type=int, default=10)
-    # parser.add_argument("--logging_steps", type=int, default=1)
-    # parser.add_argument("--save_steps", type=int, default=1)
-    # parser.add_argument("--seed", type=int, default=42)
-    # args = parser.parse_args()
-
     # Initialize argument parser
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
     ## copied from run_mlm.py:
@@ -310,28 +294,20 @@ def main():
     neg_dataset = ParquetClassificationDataset(f"{data_args.datadir}/train_negatives.parquet", tokenizer, max_length=512)
 
     # Combine datasets
-    combined_dataset = ConcatDataset([pos_dataset, neg_dataset])
-
-    ## Create balanced sampling weights: equal weight for each class
-    # labels = []
-    # for ds in [pos_dataset, neg_dataset]:
-    #     for i in range(len(ds)):
-    #         sample = ds[i]
-    #         labels.append(sample["labels"].item())
-    # labels_tensor = torch.tensor(labels)
+    # combined_dataset = ConcatDataset([pos_dataset, neg_dataset])
+    train_dataset = ConcatDataset([pos_dataset, neg_dataset])
 
     ## this change is faster? 
-    labels_tensor = torch.tensor(pd.concat([pos_dataset.df["label"], neg_dataset.df["label"]]).values)
-    class_sample_count = torch.tensor(
-        [(labels_tensor == t).sum() for t in torch.unique(labels_tensor, sorted=True)]
-    )
-    # Inverse frequency weighting
-    weights = 1. / class_sample_count.float()
-    sample_weights = weights[labels_tensor]
+    # labels_tensor = torch.tensor(pd.concat([pos_dataset.df["label"], neg_dataset.df["label"]]).values)
+    # class_sample_count = torch.tensor(
+    #     [(labels_tensor == t).sum() for t in torch.unique(labels_tensor, sorted=True)]
+    # )
+    # # Inverse frequency weighting
+    # weights = 1. / class_sample_count.float()
+    # sample_weights = weights[labels_tensor]
 
-    sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=True)
-
-    train_dataloader = DataLoader(combined_dataset, batch_size=training_args.per_device_train_batch_size, sampler=sampler, num_workers=2)
+    # sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=True)
+    # train_dataloader = DataLoader(combined_dataset, batch_size=training_args.per_device_train_batch_size, sampler=sampler, num_workers=2)
 
     # VALIDATION DATA
     val_pos_dataset = ParquetClassificationDataset(
@@ -341,88 +317,158 @@ def main():
         f"{data_args.datadir}/val_negatives.parquet", tokenizer, max_length=512
     )
     val_dataset = ConcatDataset([val_pos_dataset, val_neg_dataset])
-    val_dataloader = DataLoader(
-        val_dataset,
-        batch_size=training_args.per_device_eval_batch_size or 256,
-        shuffle=False,
-        num_workers=2,
+    # val_dataloader = DataLoader(
+    #     val_dataset,
+    #     batch_size=training_args.per_device_eval_batch_size or 256,
+    #     shuffle=False,
+    #     num_workers=2,
+    # )
+
+    # def evaluate(model, dataloader):
+    #     model.eval()
+    #     losses, correct, total = [], 0, 0
+    #     with torch.no_grad():
+    #         for batch in dataloader:
+    #             batch = {k: v.to(device) for k, v in batch.items()}
+    #             outputs = model(**batch)
+    #             losses.append(outputs.loss.item())
+    #             preds = outputs.logits.argmax(dim=-1)
+    #             correct += (preds == batch["labels"]).sum().item()
+    #             total += batch["labels"].size(0)
+    #     model.train()
+    #     return np.mean(losses), correct / total
+    # best_eval_loss = float("inf")
+    print("Printing data splits: ", flush=True)
+    for split, ds in zip(
+        ["train_pos","train_neg","val_pos","val_neg"],
+        [pos_dataset, neg_dataset, val_pos_dataset, val_neg_dataset],
+    ):
+        print(split, ds.df["label"].value_counts(), flush=True)
+
+    class BalancedTrainer(transformers.Trainer):
+        def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
+            # build the same sampler you used before
+            labels = torch.tensor(
+                pd.concat([pos_dataset.df["label"], neg_dataset.df["label"]]).values
+            )
+            class_sample_count = torch.tensor(
+                [(labels == t).sum() for t in torch.unique(labels, sorted=True)]
+            )
+            weights = 1.0 / class_sample_count.float()
+            sample_weights = weights[labels]
+            return torch.utils.data.WeightedRandomSampler(
+                sample_weights, num_samples=len(sample_weights), replacement=True
+            )
+
+    def compute_metrics(eval_pred):
+        logits, labels = eval_pred
+        probs = torch.softmax(torch.tensor(logits), dim=-1).numpy()[:, 1]
+        preds = logits.argmax(axis=-1)
+
+        return {
+            "accuracy" : accuracy_score(labels, preds),
+            "auroc"    : roc_auc_score(labels, probs),
+            "auprc"    : average_precision_score(labels, probs),
+            "mcc"      : matthews_corrcoef(labels, preds),
+        }
+
+    hf_args = TrainingArguments(
+        output_dir           = training_args.output_dir,
+        overwrite_output_dir = True,
+        num_train_epochs     = training_args.num_train_epochs,
+        per_device_train_batch_size = training_args.per_device_train_batch_size,
+        per_device_eval_batch_size  = training_args.per_device_eval_batch_size,
+        eval_strategy        = training_args.eval_strategy,
+        eval_steps           = training_args.eval_steps,
+        save_steps           = training_args.save_steps,
+        save_total_limit     = training_args.save_total_limit,
+        learning_rate        = training_args.learning_rate,
+        warmup_steps         = training_args.warmup_steps,
+        logging_dir          = os.path.join(training_args.output_dir, "logs"),
+        logging_steps        = training_args.logging_steps,
+        load_best_model_at_end = True,
+        metric_for_best_model  = training_args.metric_for_best_model,
+        report_to            = ["tensorboard"],
+        fp16                 = training_args.fp16,
+        optim                = training_args.optim,
     )
 
-    def evaluate(model, dataloader):
-        model.eval()
-        losses, correct, total = [], 0, 0
-        with torch.no_grad():
-            for batch in dataloader:
-                batch = {k: v.to(device) for k, v in batch.items()}
-                outputs = model(**batch)
-                losses.append(outputs.loss.item())
-                preds = outputs.logits.argmax(dim=-1)
-                correct += (preds == batch["labels"]).sum().item()
-                total += batch["labels"].size(0)
-        model.train()
-        return np.mean(losses), correct / total
-    best_eval_loss = float("inf")
-
-    # Set up optimizer and scheduler
-    optimizer = torch.optim.AdamW(model.parameters(), lr=training_args.learning_rate)
-    num_update_steps_per_epoch = len(train_dataloader)
-    num_training_steps = training_args.num_train_epochs * num_update_steps_per_epoch
-    lr_scheduler = get_scheduler(
-        name="cosine",
-        optimizer=optimizer,
-        num_warmup_steps=int(0.1 * num_training_steps),
-        num_training_steps=num_training_steps,
+    trainer = BalancedTrainer(
+        model          = model,
+        args           = hf_args,
+        train_dataset  = train_dataset,
+        eval_dataset   = val_dataset,
+        tokenizer      = tokenizer,
+        compute_metrics= compute_metrics,
     )
-    print(f"Number of training steps: {num_training_steps}")
-    print(f"Number of update steps per epoch: {num_update_steps_per_epoch}")
-    # Training loop
-    model.train()
-    global_step = 0
-    for epoch in tqdm(range(int(training_args.num_train_epochs))):
-        for step, batch in tqdm(enumerate(train_dataloader)):
-            # if "token_type_ids" in batch:
-            #     batch.pop("token_type_ids")
-            # print("PRINTING BATCH")
-            # print(batch)
-            optimizer.zero_grad(set_to_none=True)
-            batch = {k: v.to(device) for k, v in batch.items()}
-            outputs: SequenceClassifierOutput = model(**batch)
-            loss = outputs.loss
-            loss.backward() ## where is forward?
-            optimizer.step()
-            lr_scheduler.step()
+    # # Set up optimizer and scheduler
+    # optimizer = torch.optim.AdamW(model.parameters(), lr=training_args.learning_rate)
+    # num_update_steps_per_epoch = len(train_dataloader)
+    # num_training_steps = training_args.num_train_epochs * num_update_steps_per_epoch
+    # lr_scheduler = get_scheduler(
+    #     name="cosine",
+    #     optimizer=optimizer,
+    #     num_warmup_steps=int(0.1 * num_training_steps),
+    #     num_training_steps=num_training_steps,
+    # )
+    # print(f"Number of training steps: {num_training_steps}")
+    # print(f"Number of update steps per epoch: {num_update_steps_per_epoch}")
+    # # Training loop
+    # model.train()
+    # global_step = 0
+    # for epoch in tqdm(range(int(training_args.num_train_epochs))):
+    #     for step, batch in tqdm(enumerate(train_dataloader)):
+    #         # if "token_type_ids" in batch:
+    #         #     batch.pop("token_type_ids")
+    #         # print("PRINTING BATCH")
+    #         # print(batch)
+    #         optimizer.zero_grad(set_to_none=True)
+    #         batch = {k: v.to(device) for k, v in batch.items()}
+    #         outputs: SequenceClassifierOutput = model(**batch)
+    #         loss = outputs.loss
+    #         loss.backward() ## where is forward?
+    #         optimizer.step()
+    #         lr_scheduler.step()
             
-            global_step += 1
-            if global_step % training_args.logging_steps == 0:
-                logger.info(f"Epoch {epoch+1} Step {global_step}/{num_training_steps} Loss: {loss.item():.4f}")
+    #         global_step += 1
+    #         if global_step % training_args.logging_steps == 0:
+    #             logger.info(f"Epoch {epoch+1} Step {global_step}/{num_training_steps} Loss: {loss.item():.4f}")
             
-            if global_step % training_args.save_steps == 0:
-                os.makedirs(training_args.output_dir, exist_ok=True)
-                save_path = os.path.join(training_args.output_dir, f"checkpoint-{global_step}")
-                model.save_pretrained(save_path)
-                logger.info(f"Saved checkpoint to {save_path}")
+    #         if global_step % training_args.save_steps == 0:
+    #             os.makedirs(training_args.output_dir, exist_ok=True)
+    #             save_path = os.path.join(training_args.output_dir, f"checkpoint-{global_step}")
+    #             model.save_pretrained(save_path)
+    #             logger.info(f"Saved checkpoint to {save_path}")
             
-            ## evaluate every eval_steps
-            if global_step % training_args.eval_steps == 0:
-                eval_loss, eval_acc = evaluate(model, val_dataloader)
-                logger.info(
-                    f"[EVAL]  Step {global_step} • loss {eval_loss:.4f} • acc {eval_acc:.4%}"
-                )
+    #         ## evaluate every eval_steps
+    #         if global_step % training_args.eval_steps == 0:
+    #             eval_loss, eval_acc = evaluate(model, val_dataloader)
+    #             logger.info(
+    #                 f"[EVAL]  Step {global_step} • loss {eval_loss:.4f} • acc {eval_acc:.4%}"
+    #             )
 
-                # save best model so far
-                if eval_loss < best_eval_loss:
-                    best_eval_loss = eval_loss
-                    best_path = os.path.join(training_args.output_dir, "checkpoint-best")
-                    os.makedirs(best_path, exist_ok=True)
-                    model.save_pretrained(best_path)
-                    tokenizer.save_pretrained(best_path)
-                    logger.info(f"New best model saved to {best_path} (eval_loss {eval_loss:.4f})")
+    #             # save best model so far
+    #             if eval_loss < best_eval_loss:
+    #                 best_eval_loss = eval_loss
+    #                 best_path = os.path.join(training_args.output_dir, "checkpoint-best")
+    #                 os.makedirs(best_path, exist_ok=True)
+    #                 model.save_pretrained(best_path)
+    #                 tokenizer.save_pretrained(best_path)
+    #                 logger.info(f"New best model saved to {best_path} (eval_loss {eval_loss:.4f})")
 
     # Final save
     os.makedirs(training_args.output_dir, exist_ok=True)
-    model.save_pretrained(training_args.output_dir)
+    # model.save_pretrained(training_args.output_dir)
+    # tokenizer.save_pretrained(training_args.output_dir)
+
+    trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
+    trainer.save_model(training_args.output_dir)
     tokenizer.save_pretrained(training_args.output_dir)
     logger.info("Training complete and model saved.")
+    best_ckpt = trainer.state.best_model_checkpoint
+    logger.info("best checkpoint on disk:", best_ckpt)      # e.g. .../checkpoint-4500
+    
+    
 
 if __name__ == "__main__":
     main()
