@@ -248,6 +248,8 @@ class ConvNetForSequenceClassification(ConvNetPreTrainedModel):
         self,
         input_ids: Optional[torch.LongTensor] = None,
         labels: Optional[torch.LongTensor] = None,
+        attention_mask=None,
+        **kwargs,
     ) -> Union[SequenceClassifierOutput, Tuple[torch.Tensor]]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
