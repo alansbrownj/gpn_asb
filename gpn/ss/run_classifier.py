@@ -391,6 +391,7 @@ def main():
         report_to            = ["tensorboard"],
         fp16                 = training_args.fp16,
         optim                = training_args.optim,
+        weight_decay         = training_args.weight_decay,
     )
 
     trainer = BalancedTrainer(
