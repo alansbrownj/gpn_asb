@@ -3,6 +3,17 @@
 
 ## 2025-04-08 Tuesday W15.2 
 ## Writing this script for sequence classification
+import optuna
+from optuna.pruners import HyperbandPruner
+from optuna.visualization import (
+    plot_optimization_history,
+    plot_param_importances,
+    plot_parallel_coordinate,
+)
+from transformers import Adafactor
+
+import plotly.io as pio
+import joblib
 
 import logging
 import math
@@ -150,6 +161,12 @@ class ModelArguments:
             "help": "Whether to use one of the fast tokenizer (backed by the tokenizers library) or not."
         },
     )
+    hyperparameter_search: Optional[bool] = field(
+        default=False,
+        metadata={
+            "help": "Whether to run hyperparameter search or not. If set to True, the script will not train the model but will only run the search."
+        },
+    )
 
     # same as from run_mlm.py
     def __post_init__(self):
@@ -243,7 +260,7 @@ def main():
     ## copied from run_mlm.py:
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
         # If we pass only one argument to the script and it's the path to a json file,
-        # let's parse it to get our arguments.
+        # parse it to get our arguments.
         model_args, data_args, training_args = parser.parse_json_file(
             json_file=os.path.abspath(sys.argv[1])
         )
@@ -251,8 +268,6 @@ def main():
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
     ## also copying from the mlm py
-    # Sending telemetry. Tracking the example usage helps us better allocate resources to maintain them. The
-    # information sent is the one passed as arguments along with your Python/PyTorch versions.
     send_example_telemetry("run_classifier", model_args, data_args)
     
     logger.warning(
@@ -260,12 +275,11 @@ def main():
         + f"distributed training: {bool(training_args.local_rank != -1)}, 16-bits training: {training_args.fp16}"
     )
     logger.info(f"Training/evaluation parameters {training_args}")
-    # if data_args.min_lr_rate is not None:
-    #     print(f"Setting min_lr_rate to {data_args.min_lr_rate}")
-    #     training_args.lr_scheduler_kwargs["min_lr_rate"] = data_args.min_lr_rate
 
-    # Set seed for reproducibility
-    torch.manual_seed(training_args.seed)
+    # Set seed for reproducibility 
+    SEED = training_args.seed
+    print(f"seed used for training: {SEED}", flush=True)
+    torch.manual_seed(SEED)
 
     # Load tokenizer and config
     tokenizer = AutoTokenizer.from_pretrained(model_args.tokenizer_name)
@@ -297,18 +311,6 @@ def main():
     # combined_dataset = ConcatDataset([pos_dataset, neg_dataset])
     train_dataset = ConcatDataset([pos_dataset, neg_dataset])
 
-    ## this change is faster? 
-    # labels_tensor = torch.tensor(pd.concat([pos_dataset.df["label"], neg_dataset.df["label"]]).values)
-    # class_sample_count = torch.tensor(
-    #     [(labels_tensor == t).sum() for t in torch.unique(labels_tensor, sorted=True)]
-    # )
-    # # Inverse frequency weighting
-    # weights = 1. / class_sample_count.float()
-    # sample_weights = weights[labels_tensor]
-
-    # sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=True)
-    # train_dataloader = DataLoader(combined_dataset, batch_size=training_args.per_device_train_batch_size, sampler=sampler, num_workers=2)
-
     # VALIDATION DATA
     val_pos_dataset = ParquetClassificationDataset(
         f"{data_args.datadir}/val_positives.parquet", tokenizer, max_length=512
@@ -317,27 +319,7 @@ def main():
         f"{data_args.datadir}/val_negatives.parquet", tokenizer, max_length=512
     )
     val_dataset = ConcatDataset([val_pos_dataset, val_neg_dataset])
-    # val_dataloader = DataLoader(
-    #     val_dataset,
-    #     batch_size=training_args.per_device_eval_batch_size or 256,
-    #     shuffle=False,
-    #     num_workers=2,
-    # )
-
-    # def evaluate(model, dataloader):
-    #     model.eval()
-    #     losses, correct, total = [], 0, 0
-    #     with torch.no_grad():
-    #         for batch in dataloader:
-    #             batch = {k: v.to(device) for k, v in batch.items()}
-    #             outputs = model(**batch)
-    #             losses.append(outputs.loss.item())
-    #             preds = outputs.logits.argmax(dim=-1)
-    #             correct += (preds == batch["labels"]).sum().item()
-    #             total += batch["labels"].size(0)
-    #     model.train()
-    #     return np.mean(losses), correct / total
-    # best_eval_loss = float("inf")
+ 
     print("Printing data splits: ", flush=True)
     for split, ds in zip(
         ["train_pos","train_neg","val_pos","val_neg"],
@@ -372,6 +354,32 @@ def main():
             "mcc"      : matthews_corrcoef(labels, preds),
         }
 
+
+    def hp_space(trial):
+        optim = trial.suggest_categorical(
+            "optim", ["adamw_torch", "adafactor"]
+        )
+        if optim.startswith("adamw"):
+            lr = trial.suggest_float("learning_rate", 1e-8, 5e-4, log=True)
+            wd = trial.suggest_float("weight_decay", 1e-6, 1e-1, log=True)
+        else:  # adafactor
+            lr = trial.suggest_float("learning_rate", 5e-5, 5e-2, log=True)
+            wd = 0.0
+
+        return {"learning_rate": lr, "weight_decay": wd, "optim": optim}
+
+    # choose *one* metric to optimise  ➜   higher is better
+    def objective(metrics: Dict[str, float]) -> float:
+        return metrics["eval_loss"]
+        # return metrics["auprc"]        # change if you prefer auroc/accuracy
+
+    # Does this log to slurm? (yes! but adding a file handler too)
+    optuna.logging.set_verbosity(optuna.logging.INFO)
+    log_path = os.path.join(training_args.output_dir, "optuna_trials.log")
+    fh = logging.FileHandler(log_path, mode="a")
+    fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    optuna.logging.get_logger("optuna").addHandler(fh)
+    
     hf_args = TrainingArguments(
         output_dir           = training_args.output_dir,
         overwrite_output_dir = True,
@@ -394,82 +402,113 @@ def main():
         weight_decay         = training_args.weight_decay,
     )
 
+    def model_init():
+        """
+        Return a *new* instance of the model each time Optuna asks
+        for a trial.  It must have the *same* initial weights for every
+        trial when the seed is fixed, otherwise results aren’t comparable.
+        """
+        if model_args.model_name_or_path is not None and model_args.model_name_or_path.lower() != "none":
+            cfg = AutoConfig.from_pretrained(model_args.model_name_or_path)
+            cfg.num_labels = 2
+            return AutoModelForSequenceClassification.from_pretrained(model_args.model_name_or_path,
+                                                                    config=cfg)
+        else:
+            cfg = CONFIG_MAPPING[model_args.model_type]()
+            cfg.num_labels = 2
+            return AutoModelForSequenceClassification.from_config(cfg)
+
     trainer = BalancedTrainer(
-        model          = model,
+        model_init     = model_init,
         args           = hf_args,
         train_dataset  = train_dataset,
         eval_dataset   = val_dataset,
         tokenizer      = tokenizer,
         compute_metrics= compute_metrics,
     )
-    # # Set up optimizer and scheduler
-    # optimizer = torch.optim.AdamW(model.parameters(), lr=training_args.learning_rate)
-    # num_update_steps_per_epoch = len(train_dataloader)
-    # num_training_steps = training_args.num_train_epochs * num_update_steps_per_epoch
-    # lr_scheduler = get_scheduler(
-    #     name="cosine",
-    #     optimizer=optimizer,
-    #     num_warmup_steps=int(0.1 * num_training_steps),
-    #     num_training_steps=num_training_steps,
-    # )
-    # print(f"Number of training steps: {num_training_steps}")
-    # print(f"Number of update steps per epoch: {num_update_steps_per_epoch}")
-    # # Training loop
-    # model.train()
-    # global_step = 0
-    # for epoch in tqdm(range(int(training_args.num_train_epochs))):
-    #     for step, batch in tqdm(enumerate(train_dataloader)):
-    #         # if "token_type_ids" in batch:
-    #         #     batch.pop("token_type_ids")
-    #         # print("PRINTING BATCH")
-    #         # print(batch)
-    #         optimizer.zero_grad(set_to_none=True)
-    #         batch = {k: v.to(device) for k, v in batch.items()}
-    #         outputs: SequenceClassifierOutput = model(**batch)
-    #         loss = outputs.loss
-    #         loss.backward() ## where is forward?
-    #         optimizer.step()
-    #         lr_scheduler.step()
-            
-    #         global_step += 1
-    #         if global_step % training_args.logging_steps == 0:
-    #             logger.info(f"Epoch {epoch+1} Step {global_step}/{num_training_steps} Loss: {loss.item():.4f}")
-            
-    #         if global_step % training_args.save_steps == 0:
-    #             os.makedirs(training_args.output_dir, exist_ok=True)
-    #             save_path = os.path.join(training_args.output_dir, f"checkpoint-{global_step}")
-    #             model.save_pretrained(save_path)
-    #             logger.info(f"Saved checkpoint to {save_path}")
-            
-    #         ## evaluate every eval_steps
-    #         if global_step % training_args.eval_steps == 0:
-    #             eval_loss, eval_acc = evaluate(model, val_dataloader)
-    #             logger.info(
-    #                 f"[EVAL]  Step {global_step} • loss {eval_loss:.4f} • acc {eval_acc:.4%}"
-    #             )
-
-    #             # save best model so far
-    #             if eval_loss < best_eval_loss:
-    #                 best_eval_loss = eval_loss
-    #                 best_path = os.path.join(training_args.output_dir, "checkpoint-best")
-    #                 os.makedirs(best_path, exist_ok=True)
-    #                 model.save_pretrained(best_path)
-    #                 tokenizer.save_pretrained(best_path)
-    #                 logger.info(f"New best model saved to {best_path} (eval_loss {eval_loss:.4f})")
-
-    # Final save
+    
     os.makedirs(training_args.output_dir, exist_ok=True)
     # model.save_pretrained(training_args.output_dir)
     # tokenizer.save_pretrained(training_args.output_dir)
+
+    ## Test the tuning stuff if the flag is set
+        # ----------------------------------------------------------------------------------
+    #  HYPER-PARAMETER SEARCH BRANCH
+    # ----------------------------------------------------------------------------------
+    if model_args.hyperparameter_search:
+        # Prepare Optuna study (SQLite so multiple jobs can resume)
+        study_name = f"optuna_{int(time.time())}"
+        storage    = f"sqlite:///{os.path.join(training_args.output_dir, 'optuna.db')}"
+
+        best_run = trainer.hyperparameter_search(
+            n_trials          = 3,
+            direction         = "minimize",
+            hp_space          = hp_space,
+            compute_objective = objective,
+            backend           = "optuna",
+            study_name       = study_name,
+            storage           = storage,
+            pruner            = HyperbandPruner(
+                min_resource=1,
+                max_resource="auto",
+                reduction_factor=3,
+            ),
+
+        )
+
+        # Save study
+        study = optuna.load_study(study_name=study_name, storage=storage)
+        joblib.dump(study, os.path.join(training_args.output_dir, "optuna_study.pkl"))
+
+        dashboards = {
+            "optimization_history": plot_optimization_history(study),
+            "param_importances":    plot_param_importances(study),
+            "parallel_coordinate":  plot_parallel_coordinate(study),
+        }
+        for name, fig in dashboards.items():
+            html_path = os.path.join(training_args.output_dir, f"{name}.html")
+            fig.write_html(html_path)
+            # optional PNG (needs `pip install kaleido` which is in my "deep" conda env)
+            try:
+                png_path = os.path.join(training_args.output_dir, f"{name}.png")
+                pio.write_image(fig, png_path, format="png", width=1000, height=600)
+            except Exception as e:
+                logger.warning(f"PNG export failed for {name}: {e}")
+
+        logger.info(
+            f"Best trial run_id={best_run.run_id} "
+            f"objective={best_run.objective:.4f} "
+            f"params={best_run.hyperparameters}"
+            )
+
+        from dataclasses import replace, asdict
+
+        # build a new TrainingArguments object that merges in the tuned params
+        # new_args_dict = asdict(hf_args)
+        # new_args_dict.update(best_run.hyperparameters)
+        # hf_args = TrainingArguments(**new_args_dict) ## fails because some args are not in datasets
+        hf_args = replace(hf_args, **best_run.hyperparameters)
+        # re-initialize the trainer with the new args
+        logger.info("Re-initializing trainer with tuned hyperparameters.")
+        trainer = BalancedTrainer(
+                model_init     = model_init,
+                args           = hf_args,
+                train_dataset  = train_dataset,
+                eval_dataset   = val_dataset,
+                tokenizer      = tokenizer,
+                compute_metrics= compute_metrics,
+            )
+    # ----------------------------------------------------------------------------------
+    #  NORMAL TRAINING / FINAL TRAIN WITH BEST PARAMS
+    # ----------------------------------------------------------------------------------
+    print("Starting training with the following parameters:", trainer.args, flush=True)
 
     trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
     trainer.save_model(training_args.output_dir)
     tokenizer.save_pretrained(training_args.output_dir)
     logger.info("Training complete and model saved.")
     best_ckpt = trainer.state.best_model_checkpoint
-    logger.info("best checkpoint on disk:", best_ckpt)      # e.g. .../checkpoint-4500
-    
-    
+    logger.info(f"best checkpoint on disk: {best_ckpt}")      # e.g. .../checkpoint-4500
 
 if __name__ == "__main__":
     main()
