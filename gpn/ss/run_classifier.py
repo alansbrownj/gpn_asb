@@ -441,7 +441,7 @@ def main():
         storage    = f"sqlite:///{os.path.join(training_args.output_dir, 'optuna.db')}"
 
         best_run = trainer.hyperparameter_search(
-            n_trials          = 3,
+            n_trials          = 150,
             direction         = "minimize",
             hp_space          = hp_space,
             compute_objective = objective,
@@ -449,7 +449,7 @@ def main():
             study_name       = study_name,
             storage           = storage,
             pruner            = HyperbandPruner(
-                min_resource=1,
+                min_resource=3,
                 max_resource="auto",
                 reduction_factor=3,
             ),
