@@ -27,7 +27,7 @@ import numpy as np
 import os
 import sys
 from dataclasses import dataclass, field
-from itertools import chain
+from itertools import chain, cycle
 import torch
 from typing import Any, Callable, Dict, List, NewType, Optional, Tuple, Union
 
@@ -37,6 +37,7 @@ from datasets import load_dataset, DatasetDict, concatenate_datasets
 # import evaluate
 ## Adding EarlyStoppingCallback -- 2025-03-18 Tuesday W12.2
 import transformers
+from transformers import TrainerCallback
 from transformers import (
     CONFIG_MAPPING,
     MODEL_FOR_MASKED_LM_MAPPING,
@@ -87,6 +88,16 @@ class DataCollatorForLanguageModelingSimplified(DataCollatorForLanguageModeling)
                 labels[labels == self.tokenizer.pad_token_id] = -100
             batch["labels"] = labels
         return batch
+
+## Need to make an infinate cycler for the dataset if I am doing a super long run and resuming training from where I left off.
+## Previously used "cycle" from itertools but that seemed to lead to memory issues.
+class InfiniteIterableDataset(IterableDataset):
+    def __init__(self, base_ds):
+        self.base = base_ds
+    def __iter__(self):
+        while True:
+            for batch in self.base:
+                yield batch
 
 
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
@@ -472,7 +483,7 @@ def main():
     remove_columns = list(list(raw_datasets["train"].take(1))[0].keys())
 
     if training_args.do_train:
-        train_dataset = raw_datasets["train"].shuffle(seed=training_args.seed)
+        train_dataset = raw_datasets["train"].shuffle(seed=training_args.seed, buffer_size=50_000)
         train_dataset = train_dataset.map(
             lambda examples: tokenize_function(
                 examples, data_args.soft_masked_loss_weight_train,
@@ -487,6 +498,7 @@ def main():
             drop_last_batch=True,
             batch_size=data_args.total_batch_size,
         )
+        train_dataset = InfiniteIterableDataset(train_dataset)
 
     if training_args.do_eval:
         eval_dataset = raw_datasets["validation"].map(
@@ -511,16 +523,28 @@ def main():
         mlm_probability=data_args.mlm_probability,
     )
 
+    # how many steps per epoch?
+    # class PrintStepsPerEpoch(TrainerCallback):
+    #     def on_epoch_begin(self, args, state, control, **kwargs):
+    #         current_epoch = int(state.epoch)
+    #         if current_epoch == 0:
+    #             self._prev_step = 0
+    #         steps_this_epoch = state.global_step - getattr(self, "_prev_step", 0)
+    #         self._prev_step = state.global_step
+    #         if args.process_index == 0:          # only rank-0 prints
+    #             print(f"Epoch {current_epoch} → {steps_this_epoch} optimizer steps")
+
+    #### end new stuff. back to original code
     # Initialize our Trainer
     ## Adding early stopping on 2025-03-18 Tuesday W12.2
+    ## callbacks=[EarlyStoppingCallback(early_stopping_patience=10)
     trainer = Trainer(
     model=model,
     args=training_args,
     train_dataset=train_dataset if training_args.do_train else None,
     eval_dataset=eval_dataset if training_args.do_eval else None,
     tokenizer=tokenizer,
-    data_collator=data_collator,
-    callbacks=[EarlyStoppingCallback(early_stopping_patience=10)]
+    data_collator=data_collator
     )
 
     # Training
