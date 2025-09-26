@@ -214,7 +214,7 @@ class ConvNetModel(ConvNetPreTrainedModel):
         )
         if self.debug_prints:
             print(f"Post-embedding: {tuple(x.shape)}", flush=True)
-
+        # x = self.encoder(x)
         for i, layer in enumerate(self.encoder):
             x = layer(x)
             if self.debug_prints:
