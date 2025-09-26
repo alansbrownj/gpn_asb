@@ -34,10 +34,15 @@ class GPNEmbedding(nn.Module):
 
     def forward(self, input_ids=None, input_probs=None, aux_features=None):
         if input_ids is not None:
+            # print("input_ids shape:", input_ids.shape)
             res = F.one_hot(input_ids, num_classes=self.config.hidden_size).float()
+            # print(f"After one-hot embedding: shape {res.shape}, non-zeros: {res.nonzero().size(0)} / {res.numel()}")
+            # print(res[0, :, : self.config.vocab_size])
         elif input_probs is not None:
+            # print("input_probs shape:", input_probs.shape)
             res = F.pad(input_probs, (0, self.config.hidden_size - self.config.vocab_size))
         if aux_features is not None:
+            # print("aux_features shape:", aux_features.shape)
             if self.config.aux_features_vocab_size is not None:
                 aux_features = (
                     F.one_hot(
@@ -201,12 +206,22 @@ class ConvNetModel(ConvNetPreTrainedModel):
             ]
         )
         self.post_init()
+        self.debug_prints = False
 
     def forward(self, input_ids=None, input_probs=None, aux_features=None, **kwargs):
         x = self.embedding(
             input_ids=input_ids, input_probs=input_probs, aux_features=aux_features
         )
-        x = self.encoder(x)
+        if self.debug_prints:
+            print(f"Post-embedding: {tuple(x.shape)}", flush=True)
+
+        for i, layer in enumerate(self.encoder):
+            x = layer(x)
+            if self.debug_prints:
+                with torch.no_grad():
+                    nz = torch.count_nonzero(x).item()
+                    print(f"After layer {i}: shape {tuple(x.shape)}, "
+                          f"non-zeros: {nz} / {x.numel()}", flush=True)
         return BaseModelOutput(last_hidden_state=x)
 
 
@@ -415,8 +430,11 @@ class ConvLayer(nn.Module):
         )
 
     def forward(self, x):
+        # print(f"ConvLayer input: shape {x.shape}, non-zeros: {x.nonzero().size(0)} / {x.numel()}")
         x = x + self.conv(x)
+        # print(f"After conv: shape {x.shape}, non-zeros: {x.nonzero().size(0)} / {x.numel()}")
         x = x + self.ffn(x)
+        # print(f"After ffn: shape {x.shape}, non-zeros: {x.nonzero().size(0)} / {x.numel()}")
         return x
 
 

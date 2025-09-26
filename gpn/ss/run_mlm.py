@@ -35,7 +35,7 @@ import datasets
 from datasets import load_dataset, DatasetDict, concatenate_datasets
 
 # import evaluate
-## Adding EarlyStoppingCallback -- 2025-03-18 Tuesday W12.2
+## Adding EarlyStoppingCallback -- 2025-03-18 Tuesday W12.2 (and later removed)
 import transformers
 from transformers import TrainerCallback
 from transformers import (
@@ -395,7 +395,7 @@ def main():
     print(raw_datasets)
 
     # Load pretrained model and tokenizer
-    #
+
     # Distributed training:
     # The .from_pretrained methods guarantee that only one local process can concurrently
     # download model & vocab.
