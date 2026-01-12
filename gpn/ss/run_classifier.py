@@ -253,10 +253,45 @@ class DataTrainingArguments:
                         "`validation_file` should be a csv, a json or a txt file."
                     )
 
+@dataclass
+class CustomTrainingArguments(TrainingArguments):
+    """
+    Extend HF TrainingArguments with CyclicLR knobs. Keep defaults so existing
+    behavior is unchanged unless explicitly enabled.
+    """
+    use_cyclic_lr: bool = field(
+        default=False,
+        metadata={"help": "If true, use torch.optim.lr_scheduler.CyclicLR instead of the HF scheduler."},
+    )
+    base_lr: float = field(
+        default=1e-5,
+        metadata={"help": "CyclicLR base_lr (min LR)."},
+    )
+    max_lr: float = field(
+        default=1e-3,
+        metadata={"help": "CyclicLR max_lr (peak LR)."},
+    )
+    cycle_steps_up: int = field(
+        default=1000,
+        metadata={"help": "CyclicLR step_size_up."},
+    )
+    cycle_steps_down: Optional[int] = field(
+        default=None,
+        metadata={"help": "CyclicLR step_size_down; defaults to cycle_steps_up if None."},
+    )
+    cycle_mode: str = field(
+        default="triangular2",
+        metadata={"help": "CyclicLR mode (e.g., triangular, triangular2, exp_range)."},
+    )
+    cycle_gamma: float = field(
+        default=1.0,
+        metadata={"help": "CyclicLR gamma (used by exp_range mode)."},
+    )
+
 # ----- Main training function ----- #
 def main():
     # Initialize argument parser
-    parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
+    parser = HfArgumentParser((ModelArguments, DataTrainingArguments, CustomTrainingArguments))
     ## copied from run_mlm.py:
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
         # If we pass only one argument to the script and it's the path to a json file,
@@ -327,6 +362,18 @@ def main():
     ):
         print(split, ds.df["label"].value_counts(), flush=True)
 
+    # Estimate steps per epoch (optimizer steps), accounting for grad accumulation and DDP
+    world_size = max(1, training_args.world_size)  # number of processes
+    eff_batch = training_args.per_device_train_batch_size * training_args.gradient_accumulation_steps * world_size
+    steps_per_epoch = math.ceil(len(train_dataset) / eff_batch)
+    print(
+        f"Train examples: {len(train_dataset)}, world_size: {world_size}, "
+        f"per_device_batch: {training_args.per_device_train_batch_size}, "
+        f"grad_accum: {training_args.gradient_accumulation_steps}, "
+        f"steps_per_epoch (optimizer steps): {steps_per_epoch}",
+        flush=True,
+    )
+
     class BalancedTrainer(transformers.Trainer):
         def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
             # build the same sampler you used before
@@ -342,33 +389,63 @@ def main():
                 sample_weights, num_samples=len(sample_weights), replacement=True
             )
 
+        def create_scheduler(self, num_training_steps: int, optimizer=None):
+            """
+            Override to allow a CyclicLR schedule when requested; otherwise fall
+            back to the HF default scheduler creation.
+            """
+            if getattr(self.args, "use_cyclic_lr", False):
+                opt = optimizer if optimizer is not None else self.optimizer
+                if opt is None:
+                    raise ValueError("Optimizer must be set before creating the scheduler.")
+                self.lr_scheduler = torch.optim.lr_scheduler.CyclicLR(
+                    opt,
+                    base_lr=self.args.base_lr,
+                    max_lr=self.args.max_lr,
+                    step_size_up=self.args.cycle_steps_up,
+                    step_size_down=self.args.cycle_steps_down or self.args.cycle_steps_up,
+                    mode=self.args.cycle_mode,
+                    gamma=self.args.cycle_gamma,
+                    cycle_momentum=False,  # AdamW/Adafactor do not use momentum buffers here
+                )
+                self._created_lr_scheduler = True
+                return self.lr_scheduler
+            return super().create_scheduler(num_training_steps, optimizer)
+
     def compute_metrics(eval_pred):
         logits, labels = eval_pred
+        labels = np.array(labels)
         probs = torch.softmax(torch.tensor(logits), dim=-1).numpy()[:, 1]
         preds = logits.argmax(axis=-1)
-
+        pos_frac = labels.mean()
         return {
-            "accuracy" : accuracy_score(labels, preds),
-            "auroc"    : roc_auc_score(labels, probs),
-            "auprc"    : average_precision_score(labels, probs),
-            "mcc"      : matthews_corrcoef(labels, preds),
+            "accuracy"    : accuracy_score(labels, preds),
+            "auroc"       : roc_auc_score(labels, probs),
+            "auprc"       : average_precision_score(labels, probs),
+            "mcc"         : matthews_corrcoef(labels, preds),
+            "random_auprc": pos_frac,
         }
 
 
     def hp_space(trial):
-        optim = trial.suggest_categorical(
-            "optim", ["adamw_torch", "adafactor"]
-        )
-        if optim.startswith("adamw"):
-            lr = trial.suggest_float("learning_rate", 1e-8, 5e-4, log=True)
-            wd = trial.suggest_float("weight_decay", 1e-6, 1e-1, log=True)
-        else:  # adafactor
-            lr = trial.suggest_float("learning_rate", 5e-5, 5e-2, log=True)
-            wd = 0.0
+        # Tune CyclicLR
+        base_lr = trial.suggest_float("base_lr", 1e-8, 5e-7, log=True)
+        max_lr = trial.suggest_float("max_lr", base_lr * 5.0, base_lr * 200.0, log=True)
+        cycle_steps_up = trial.suggest_int("cycle_steps_up", 500, 4000, step=250)
+        cycle_steps_down = trial.suggest_int("cycle_steps_down", 500, 8000, step=250)
+        cycle_gamma = trial.suggest_float("cycle_gamma", 0.9995, 0.99999)
 
-        return {"learning_rate": lr, "weight_decay": wd, "optim": optim}
+        return {
+            "use_cyclic_lr": True,
+            "learning_rate": base_lr,
+            "base_lr": base_lr,
+            "max_lr": max_lr,
+            "cycle_steps_up": cycle_steps_up,
+            "cycle_steps_down": cycle_steps_down,
+            "cycle_gamma": cycle_gamma,
+        }
 
-    # choose *one* metric to optimise  ➜   higher is better
+    # choose *one* metric to optimise for hyperparameter search
     def objective(metrics: Dict[str, float]) -> float:
         return metrics["eval_loss"]
         # return metrics["auprc"]        # change if you prefer auroc/accuracy
@@ -379,28 +456,29 @@ def main():
     fh = logging.FileHandler(log_path, mode="a")
     fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     optuna.logging.get_logger("optuna").addHandler(fh)
-    
-    hf_args = TrainingArguments(
-        output_dir           = training_args.output_dir,
-        overwrite_output_dir = True,
-        num_train_epochs     = training_args.num_train_epochs,
-        per_device_train_batch_size = training_args.per_device_train_batch_size,
-        per_device_eval_batch_size  = training_args.per_device_eval_batch_size,
-        eval_strategy        = training_args.eval_strategy,
-        eval_steps           = training_args.eval_steps,
-        save_steps           = training_args.save_steps,
-        save_total_limit     = training_args.save_total_limit,
-        learning_rate        = training_args.learning_rate,
-        warmup_steps         = training_args.warmup_steps,
-        logging_dir          = os.path.join(training_args.output_dir, "logs"),
-        logging_steps        = training_args.logging_steps,
-        load_best_model_at_end = True,
-        metric_for_best_model  = training_args.metric_for_best_model,
-        report_to            = ["tensorboard"],
-        fp16                 = training_args.fp16,
-        optim                = training_args.optim,
-        weight_decay         = training_args.weight_decay,
-    )
+
+    hf_args = training_args # redefining it was a mistake.... caused some problems.
+    # hf_args = TrainingArguments(
+    #     output_dir           = training_args.output_dir,
+    #     overwrite_output_dir = True,
+    #     num_train_epochs     = training_args.num_train_epochs,
+    #     per_device_train_batch_size = training_args.per_device_train_batch_size,
+    #     per_device_eval_batch_size  = training_args.per_device_eval_batch_size,
+    #     eval_strategy        = training_args.eval_strategy,
+    #     eval_steps           = training_args.eval_steps,
+    #     save_steps           = training_args.save_steps,
+    #     save_total_limit     = training_args.save_total_limit,
+    #     learning_rate        = training_args.learning_rate,
+    #     warmup_steps         = training_args.warmup_steps,
+    #     logging_dir          = os.path.join(training_args.output_dir, "logs"),
+    #     logging_steps        = training_args.logging_steps,
+    #     load_best_model_at_end = True,
+    #     metric_for_best_model  = training_args.metric_for_best_model,
+    #     report_to            = ["tensorboard"],
+    #     fp16                 = training_args.fp16,
+    #     optim                = training_args.optim,
+    #     weight_decay         = training_args.weight_decay,
+    # )
 
     def model_init():
         """
@@ -449,9 +527,9 @@ def main():
             study_name       = study_name,
             storage           = storage,
             pruner            = HyperbandPruner(
-                min_resource=3,
+                min_resource=steps_per_epoch * 3.5,
                 max_resource="auto",
-                reduction_factor=3,
+                reduction_factor=2,
             ),
 
         )
