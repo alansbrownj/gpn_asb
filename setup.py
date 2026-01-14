@@ -2,7 +2,7 @@ from setuptools import setup
 
 
 install_requires = [
-    "transformers[torch]",
+    "transformers",
     "datasets",
     "pyarrow",
     "pandas",
