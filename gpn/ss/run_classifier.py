@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from itertools import chain
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import argparse
 import time
 from typing import Any, Callable, Dict, List, NewType, Optional, Tuple, Union
@@ -196,6 +197,10 @@ class DataTrainingArguments:
         default=None,
         metadata={"help": "The input data directory. Should contain the training files for the model."}
     )
+    max_seq_length: int = field(
+        default=512,
+        metadata={"help": "Maximum sequence length for tokenization (padding/truncation)."}
+    )
     train_file: Optional[str] = field(
         default=None, metadata={"help": "The input training data file (a text file)."}
     )
@@ -339,8 +344,12 @@ def main():
     model.to(device)
 
     # Load the positive and negative datasets for training
-    pos_dataset = ParquetClassificationDataset(f"{data_args.datadir}/train_positives.parquet", tokenizer, max_length=512)
-    neg_dataset = ParquetClassificationDataset(f"{data_args.datadir}/train_negatives.parquet", tokenizer, max_length=512)
+    pos_dataset = ParquetClassificationDataset(
+        f"{data_args.datadir}/train_positives.parquet", tokenizer, max_length=data_args.max_seq_length
+    )
+    neg_dataset = ParquetClassificationDataset(
+        f"{data_args.datadir}/train_negatives.parquet", tokenizer, max_length=data_args.max_seq_length
+    )
 
     # Combine datasets
     # combined_dataset = ConcatDataset([pos_dataset, neg_dataset])
@@ -348,18 +357,47 @@ def main():
 
     # VALIDATION DATA
     val_pos_dataset = ParquetClassificationDataset(
-        f"{data_args.datadir}/val_positives.parquet", tokenizer, max_length=512
+        f"{data_args.datadir}/val_positives.parquet", tokenizer, max_length=data_args.max_seq_length
     )
     val_neg_dataset = ParquetClassificationDataset(
-        f"{data_args.datadir}/val_negatives.parquet", tokenizer, max_length=512
+        f"{data_args.datadir}/val_negatives.parquet", tokenizer, max_length=data_args.max_seq_length
     )
     val_dataset = ConcatDataset([val_pos_dataset, val_neg_dataset])
+
+    # TEST DATA (optional): if missing, training/eval continues without test metrics.
+    test_pos_path = os.path.join(data_args.datadir, "test_positives.parquet")
+    test_neg_path = os.path.join(data_args.datadir, "test_negatives.parquet")
+    if os.path.exists(test_pos_path) and os.path.exists(test_neg_path):
+        test_pos_dataset = ParquetClassificationDataset(
+            test_pos_path, tokenizer, max_length=data_args.max_seq_length
+        )
+        test_neg_dataset = ParquetClassificationDataset(
+            test_neg_path, tokenizer, max_length=data_args.max_seq_length
+        )
+        test_dataset = ConcatDataset([test_pos_dataset, test_neg_dataset])
+    else:
+        test_dataset = None
+        logger.warning(
+            "Test parquet files not found at %s and %s. Test metrics (including test_auprc) will be skipped.",
+            test_pos_path,
+            test_neg_path,
+        )
  
     print("Printing data splits: ", flush=True)
-    for split, ds in zip(
-        ["train_pos","train_neg","val_pos","val_neg"],
-        [pos_dataset, neg_dataset, val_pos_dataset, val_neg_dataset],
-    ):
+    split_datasets = [
+        ("train_pos", pos_dataset),
+        ("train_neg", neg_dataset),
+        ("val_pos", val_pos_dataset),
+        ("val_neg", val_neg_dataset),
+    ]
+    if test_dataset is not None:
+        split_datasets.extend(
+            [
+                ("test_pos", test_pos_dataset),
+                ("test_neg", test_neg_dataset),
+            ]
+        )
+    for split, ds in split_datasets:
         print(split, ds.df["label"].value_counts(), flush=True)
 
     # Estimate steps per epoch (optimizer steps), accounting for grad accumulation and DDP
@@ -373,21 +411,51 @@ def main():
         f"steps_per_epoch (optimizer steps): {steps_per_epoch}",
         flush=True,
     )
+    ## Going to try weighting the loss of the positives. 
+    pos = len(pos_dataset)
+    neg = len(neg_dataset)
+    # w_pos = math.sqrt(neg / max(pos, 1))
+    w_pos = neg / max(pos, 1)
+    class_weight = torch.tensor([1.0, w_pos], dtype=torch.float)
+    print(f"Class weights for loss: {class_weight.numpy()}", flush=True)
 
     class BalancedTrainer(transformers.Trainer):
-        def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
-            # build the same sampler you used before
-            labels = torch.tensor(
-                pd.concat([pos_dataset.df["label"], neg_dataset.df["label"]]).values
-            )
-            class_sample_count = torch.tensor(
-                [(labels == t).sum() for t in torch.unique(labels, sorted=True)]
-            )
-            weights = 1.0 / class_sample_count.float()
-            sample_weights = weights[labels]
-            return torch.utils.data.WeightedRandomSampler(
-                sample_weights, num_samples=len(sample_weights), replacement=True
-            )
+        def __init__(self, *args, class_weight=None, test_dataset=None, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.class_weight = class_weight  # tensor([w_neg, w_pos]) or None
+            self.test_dataset = test_dataset
+        
+        def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None, **kwargs):
+            labels = inputs["labels"]
+            outputs = model(**{k: v for k, v in inputs.items() if k != "labels"})
+            ## changing from below, because maybe I should not mutate the dict?
+            # labels = inputs.pop("labels")
+            # outputs = model(**inputs)
+            logits = outputs.logits
+
+            # w = None
+            if self.class_weight is not None:
+                w = self.class_weight.to(logits.device, dtype=torch.float32)
+            else:
+                w = None
+            
+            # loss = F.cross_entropy(logits.view(-1, model.config.num_labels), labels.view(-1), weight=w)
+            loss = F.cross_entropy(logits, labels, weight=w)
+            return (loss, outputs) if return_outputs else loss
+
+        # def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
+        #     # build the same sampler you used before
+        #     labels = torch.tensor(
+        #         pd.concat([pos_dataset.df["label"], neg_dataset.df["label"]]).values
+        #     )
+        #     class_sample_count = torch.tensor(
+        #         [(labels == t).sum() for t in torch.unique(labels, sorted=True)]
+        #     )
+        #     weights = 1.0 / class_sample_count.float()
+        #     sample_weights = weights[labels]
+        #     return torch.utils.data.WeightedRandomSampler(
+        #         sample_weights, num_samples=len(sample_weights), replacement=True
+        #     )
 
         def create_scheduler(self, num_training_steps: int, optimizer=None):
             """
@@ -412,18 +480,78 @@ def main():
                 return self.lr_scheduler
             return super().create_scheduler(num_training_steps, optimizer)
 
+        def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
+            """
+            Keep standard evaluation behavior, and additionally compute/log
+            train auPRC with the same compute_metrics logic used for eval.
+            """
+            eval_metrics = super().evaluate(
+                eval_dataset=eval_dataset,
+                ignore_keys=ignore_keys,
+                metric_key_prefix=metric_key_prefix,
+            )
+
+            # Avoid recursion if someone explicitly runs a train-prefixed evaluate.
+            if metric_key_prefix == "train":
+                return eval_metrics
+
+            # TRAIN auPRC LOGGING BLOCK (comment out to disable)
+            # if self.train_dataset is not None:
+            #     train_metrics = self.predict(
+            #         self.train_dataset,
+            #         ignore_keys=ignore_keys,
+            #         metric_key_prefix="train",
+            #     ).metrics
+            #     train_auprc = train_metrics.get("train_auprc")
+            #     if train_auprc is not None:
+            #         self.log({"train_auprc": train_auprc})
+            #         eval_metrics["train_auprc"] = train_auprc
+
+            if metric_key_prefix == "eval" and self.test_dataset is not None:
+                test_metrics = self.predict(
+                    self.test_dataset,
+                    ignore_keys=ignore_keys,
+                    metric_key_prefix="test",
+                ).metrics
+                test_auprc = test_metrics.get("test_auprc")
+                if test_auprc is not None:
+                    self.log({"test_auprc": test_auprc})
+                    eval_metrics["test_auprc"] = test_auprc
+
+            return eval_metrics
+
     def compute_metrics(eval_pred):
         logits, labels = eval_pred
-        labels = np.array(labels)
-        probs = torch.softmax(torch.tensor(logits), dim=-1).numpy()[:, 1]
-        preds = logits.argmax(axis=-1)
+        labels = np.asarray(labels)
+
+        logits_t = torch.tensor(logits)
+        labels_t = torch.tensor(labels, dtype=torch.long)
+
+        # probs for AUPRC
+        probs = torch.softmax(logits_t, dim=-1).numpy()[:, 1]
+        preds = logits_t.argmax(dim=-1).numpy()
+
+        # per-example cross entropy
+        per_ex_xent = F.cross_entropy(logits_t, labels_t, reduction="none").numpy()
+
+        pos_mask = labels == 1
+        neg_mask = labels == 0
+
+        xent_pos = per_ex_xent[pos_mask].mean() if pos_mask.any() else np.nan
+        xent_neg = per_ex_xent[neg_mask].mean() if neg_mask.any() else np.nan
+        xent_balanced = 0.5 * (xent_pos + xent_neg) if (pos_mask.any() and neg_mask.any()) else np.nan
+
         pos_frac = labels.mean()
+
         return {
-            "accuracy"    : accuracy_score(labels, preds),
-            "auroc"       : roc_auc_score(labels, probs),
-            "auprc"       : average_precision_score(labels, probs),
-            "mcc"         : matthews_corrcoef(labels, preds),
+            "accuracy": accuracy_score(labels, preds),
+            "auroc": roc_auc_score(labels, probs),
+            "auprc": average_precision_score(labels, probs),
+            "mcc": matthews_corrcoef(labels, preds),
             "random_auprc": pos_frac,
+            "cross_entropy_pos": xent_pos,
+            "cross_entropy_neg": xent_neg,
+            "cross_entropy_balanced": xent_balanced,
         }
 
 
@@ -503,6 +631,8 @@ def main():
         eval_dataset   = val_dataset,
         tokenizer      = tokenizer,
         compute_metrics= compute_metrics,
+        class_weight   = class_weight,
+        test_dataset   = test_dataset,
     )
     
     os.makedirs(training_args.output_dir, exist_ok=True)
@@ -575,6 +705,8 @@ def main():
                 eval_dataset   = val_dataset,
                 tokenizer      = tokenizer,
                 compute_metrics= compute_metrics,
+                class_weight   = class_weight,
+                test_dataset   = test_dataset,
             )
     # ----------------------------------------------------------------------------------
     #  NORMAL TRAINING / FINAL TRAIN WITH BEST PARAMS

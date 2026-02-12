@@ -105,20 +105,61 @@ class ClassificationHead(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        self.dense = nn.Linear(config.hidden_size * 2, config.hidden_size)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         self.out_proj = nn.Linear(config.hidden_size, config.num_labels)
 
         self.config = config
 
     def forward(self, features, **kwargs):
-        x = features.mean(axis=1)  # mean pooling
+        # x = features.mean(axis=1)  # mean pooling
+        # x = features.max(axis=1).values  # max pooling
+        ## testing mean max pooling, make sure to change the self.dense to match
+        x_mean = features.mean(axis=1)
+        x_max = features.max(axis=1).values
+        x = torch.cat([x_mean, x_max], dim=1) # size should be (B, H*2)
         x = self.dropout(x)
         x = self.dense(x)
         x = ACT2FN[self.config.hidden_act](x)
         x = self.dropout(x)
         x = self.out_proj(x)
         return x
+
+
+## Tried a new classification head with attention pooling + max pooling, but it didn't improve performance, so sticking to the simpler max pooling head for now. Can revisit later if we want to squeeze more performance out.
+# class ClassificationHead(nn.Module):
+#     """Head for sentence-level classification tasks."""
+
+#     def __init__(self, config):
+#         super().__init__()
+#         hidden_size = config.hidden_size
+#         bottleneck = max(1, hidden_size // 4)
+#         self.ln = nn.LayerNorm(hidden_size)
+#         self.attn = nn.Sequential(
+#             nn.Linear(hidden_size, bottleneck),
+#             nn.Tanh(),
+#             nn.Linear(bottleneck, 1, bias=False),
+#         )
+#         self.dropout = nn.Dropout(config.hidden_dropout_prob)
+#         self.dense = nn.Linear(hidden_size * 2, hidden_size)
+#         self.out_proj = nn.Linear(hidden_size, config.num_labels)
+
+#         self.config = config
+
+#     def forward(self, features, **kwargs):
+#         # print("USING NEW CLASSIFICATION HEAD W05.3_XTuQB_2026-01-28-Wed")
+#         x = self.ln(features)
+#         attn_scores = self.attn(x)
+#         attn_weights = torch.softmax(attn_scores, dim=1)
+#         attn_pool = torch.sum(attn_weights * x, dim=1)
+#         max_pool = x.max(axis=1).values
+#         x = torch.cat([attn_pool, max_pool], dim=1)
+#         x = self.dropout(x)
+#         x = self.dense(x)
+#         x = ACT2FN[self.config.hidden_act](x)
+#         x = self.dropout(x)
+#         x = self.out_proj(x)
+#         return x
 
 
 class ConvNetConfig(PretrainedConfig):
@@ -408,9 +449,11 @@ class ConvLayer(nn.Module):
     def __init__(
         self,
         hidden_size=None,
+        dropout_p=0.35,
         **kwargs,
     ):
         super().__init__()
+        self.resid_dropout = nn.Dropout(dropout_p)
         self.conv = nn.Sequential(
             TransposeLayer(),
             nn.Conv1d(
@@ -431,9 +474,9 @@ class ConvLayer(nn.Module):
 
     def forward(self, x):
         # print(f"ConvLayer input: shape {x.shape}, non-zeros: {x.nonzero().size(0)} / {x.numel()}")
-        x = x + self.conv(x)
+        x = x + self.resid_dropout(self.conv(x))
         # print(f"After conv: shape {x.shape}, non-zeros: {x.nonzero().size(0)} / {x.numel()}")
-        x = x + self.ffn(x)
+        x = x + self.resid_dropout(self.ffn(x))
         # print(f"After ffn: shape {x.shape}, non-zeros: {x.nonzero().size(0)} / {x.numel()}")
         return x
 
