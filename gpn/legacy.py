@@ -126,6 +126,43 @@ class ClassificationHead(nn.Module):
         return x
 
 
+class LSTMClassificationHead(nn.Module):
+    """Head for sentence-level classification tasks."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        self.out_proj = nn.Linear(config.hidden_size, config.num_labels)
+
+        self.config = config
+        self.lstm = nn.LSTM(
+            input_size=config.hidden_size,
+            hidden_size=config.hidden_size // 2, #bidirectional LSTM should double the size, so this returns it
+            num_layers=1,
+            bias=True,
+            batch_first=True, #mostly cosmetic because I like (batch, seq, feature)
+            bidirectional=True
+        )
+        self.norm = nn.LayerNorm(config.hidden_size)
+
+    def forward(self, features, **kwargs):
+        # LSTM is numerically unstable in fp16 for long sequences — run in fp32
+        with torch.amp.autocast("cuda", enabled=False):
+            lstm_out, (h_n, _) = self.lstm(features.float())  # lstm_out: (B, L, H)
+        # Pool: mean of all timesteps + final hidden states from both directions
+        # x_mean = lstm_out.mean(dim=1)                          # (B, H)
+        x_last = torch.cat([h_n[0], h_n[1]], dim=1)           # (B, H)
+        # x = torch.cat([x_mean, x_last], dim=1) ## or would x_mean + x_last also work? NO! that is adding, this is catting
+        x = x_last
+        x = self.norm(x)
+        x = self.dropout(x)
+        x = self.dense(x)
+        x = ACT2FN[self.config.hidden_act](x)
+        x = self.dropout(x)
+        x = self.out_proj(x)
+        return x
+
 ## Tried a new classification head with attention pooling + max pooling, but it didn't improve performance, so sticking to the simpler max pooling head for now. Can revisit later if we want to squeeze more performance out.
 # class ClassificationHead(nn.Module):
 #     """Head for sentence-level classification tasks."""
@@ -178,8 +215,9 @@ class ConvNetConfig(PretrainedConfig):
         initializer_range=0.02,
         n_aux_features=0,
         aux_features_vocab_size=5,
+        conv_dropout_p=0.16,
         # for classification head:
-        hidden_dropout_prob=0.1,
+        hidden_dropout_prob=0.4,
         hidden_act="gelu",
         regression_softplus=False,
         **kwargs,
@@ -197,6 +235,7 @@ class ConvNetConfig(PretrainedConfig):
         self.n_aux_features = n_aux_features
         self.aux_features_vocab_size = aux_features_vocab_size
         self.hidden_dropout_prob = hidden_dropout_prob
+        self.conv_dropout_p = conv_dropout_p
         self.hidden_act = hidden_act
         self.regression_softplus = regression_softplus
 
@@ -240,6 +279,7 @@ class ConvNetModel(ConvNetPreTrainedModel):
             *[
                 ConvLayer(
                     hidden_size=config.hidden_size,
+                    dropout_p=config.conv_dropout_p,
                     kernel_size=config.kernel_size,
                     dilation=self.dilation_schedule[i],
                 )
@@ -294,7 +334,8 @@ class ConvNetForSequenceClassification(ConvNetPreTrainedModel):
         super().__init__(config)
         self.num_labels = config.num_labels
         self.model = ConvNetModel(config)
-        self.classifier = ClassificationHead(config)
+        # self.classifier = ClassificationHead(config)  # original mean+max pooling head
+        self.classifier = LSTMClassificationHead(config)
         self.regression_softplus = config.regression_softplus
 
         # Initialize weights and apply final processing
@@ -512,6 +553,7 @@ class ConvNetEncoder(nn.Module):
             *[
                 ConvLayer(
                     hidden_size=config.hidden_size,
+                    dropout_p=config.conv_dropout_p,
                     kernel_size=config.kernel_size,
                     dilation=dilation_schedule[i],
                 )

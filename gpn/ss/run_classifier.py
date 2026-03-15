@@ -15,11 +15,14 @@ from transformers import Adafactor
 import plotly.io as pio
 import joblib
 
+import csv
 import logging
 import math
+import json
 import numpy as np
 import os
 import sys
+from collections import Counter
 from dataclasses import dataclass, field
 from itertools import chain
 import torch
@@ -168,6 +171,30 @@ class ModelArguments:
             "help": "Whether to run hyperparameter search or not. If set to True, the script will not train the model but will only run the search."
         },
     )
+    hpo_total_trials: int = field(
+        default=100,
+        metadata={"help": "Target total number of HPO trials across all workers."},
+    )
+    hpo_worker_count: int = field(
+        default=1,
+        metadata={"help": "Number of parallel HPO workers sharing one study."},
+    )
+    hpo_worker_index: int = field(
+        default=0,
+        metadata={"help": "0-based worker index for this process."},
+    )
+    hpo_study_name: str = field(
+        default="convnet_classifier_hpo",
+        metadata={"help": "Stable Optuna study name for shared-worker tuning."},
+    )
+    hpo_storage: Optional[str] = field(
+        default=None,
+        metadata={"help": "Optuna storage URL. Defaults to sqlite:///<output_dir>/optuna.db"},
+    )
+    train_best_after_search: bool = field(
+        default=False,
+        metadata={"help": "If true, train once after HPO using best hyperparameters."},
+    )
 
     # same as from run_mlm.py
     def __post_init__(self):
@@ -177,6 +204,12 @@ class ModelArguments:
             raise ValueError(
                 "--config_overrides can't be used in combination with --config_name or --model_name_or_path"
             )
+        if self.hpo_total_trials < 0:
+            raise ValueError("--hpo_total_trials must be >= 0")
+        if self.hpo_worker_count <= 0:
+            raise ValueError("--hpo_worker_count must be > 0")
+        if self.hpo_worker_index < 0 or self.hpo_worker_index >= self.hpo_worker_count:
+            raise ValueError("--hpo_worker_index must be in [0, hpo_worker_count)")
 
 @dataclass
 class DataTrainingArguments:
@@ -292,6 +325,14 @@ class CustomTrainingArguments(TrainingArguments):
         default=1.0,
         metadata={"help": "CyclicLR gamma (used by exp_range mode)."},
     )
+    hidden_dropout_prob: float = field(
+        default=0.1,
+        metadata={"help": "Dropout probability for the ConvNet classification head."},
+    )
+    conv_dropout_p: float = field(
+        default=0.35,
+        metadata={"help": "Dropout probability for ConvLayer residual dropout."},
+    )
 
 # ----- Main training function ----- #
 def main():
@@ -321,27 +362,44 @@ def main():
     print(f"seed used for training: {SEED}", flush=True)
     torch.manual_seed(SEED)
 
-    # Load tokenizer and config
+    # Load tokenizer and model builder
     tokenizer = AutoTokenizer.from_pretrained(model_args.tokenizer_name)
-    # Initialize model configuration and model
-    if model_args.model_name_or_path is not None and model_args.model_name_or_path.lower() != "none":
-        # Load pretrained configuration and model
-        config = AutoConfig.from_pretrained(model_args.model_name_or_path)
-        config.num_labels = 2  # binary classification
-        model = AutoModelForSequenceClassification.from_pretrained(model_args.model_name_or_path, config=config)
-        logger.info(f"Loaded pre-trained model from {model_args.model_name_or_path}")
-    else:
-        # Initialize the model from scratch using the provided model type.
-        # Make sure the model type exists in CONFIG_MAPPING.
+
+    def _apply_runtime_config(cfg):
+        cfg.num_labels = 2  # binary classification
+        cfg.hidden_dropout_prob = training_args.hidden_dropout_prob
+        setattr(cfg, "conv_dropout_p", training_args.conv_dropout_p)
+        return cfg
+
+    def _build_model_with_runtime_config():
+        if model_args.model_name_or_path is not None and model_args.model_name_or_path.lower() != "none":
+            cfg = AutoConfig.from_pretrained(model_args.model_name_or_path)
+            cfg = _apply_runtime_config(cfg)
+            model = AutoModelForSequenceClassification.from_pretrained(
+                model_args.model_name_or_path, config=cfg
+            )
+            logger.info(
+                "Loaded pre-trained model from %s with hidden_dropout_prob=%.4f conv_dropout_p=%.4f",
+                model_args.model_name_or_path,
+                cfg.hidden_dropout_prob,
+                getattr(cfg, "conv_dropout_p", float("nan")),
+            )
+            return cfg, model
+
         if model_args.model_type not in CONFIG_MAPPING:
-            raise ValueError(f"Unknown model type: {model_args.model_type}. Available types: {list(CONFIG_MAPPING.keys())}")
-        config = CONFIG_MAPPING[model_args.model_type]()
-        config.num_labels = 2
-        model = AutoModelForSequenceClassification.from_config(config)
-        logger.info(f"Initialized model from scratch using the configuration for {model_args.model_type}")
-    
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
+            raise ValueError(
+                f"Unknown model type: {model_args.model_type}. Available types: {list(CONFIG_MAPPING.keys())}"
+            )
+        cfg = CONFIG_MAPPING[model_args.model_type]()
+        cfg = _apply_runtime_config(cfg)
+        model = AutoModelForSequenceClassification.from_config(cfg)
+        logger.info(
+            "Initialized model from scratch for %s with hidden_dropout_prob=%.4f conv_dropout_p=%.4f",
+            model_args.model_type,
+            cfg.hidden_dropout_prob,
+            getattr(cfg, "conv_dropout_p", float("nan")),
+        )
+        return cfg, model
 
     # Load the positive and negative datasets for training
     pos_dataset = ParquetClassificationDataset(
@@ -350,6 +408,15 @@ def main():
     neg_dataset = ParquetClassificationDataset(
         f"{data_args.datadir}/train_negatives.parquet", tokenizer, max_length=data_args.max_seq_length
     )
+
+    ## Going to try weighting the loss of the positives. 
+    ## MIGHT NEED TO MOVE THIS CODE. 
+    # pos = len(pos_dataset)
+    # neg = len(neg_dataset)
+    # # w_pos = math.sqrt(neg / max(pos, 1))
+    # w_pos = neg / max(pos, 1)
+    # class_weight = torch.tensor([1.0, w_pos], dtype=torch.float)
+    # print(f"Class weights for loss: {class_weight.numpy()}", flush=True)
 
     # Combine datasets
     # combined_dataset = ConcatDataset([pos_dataset, neg_dataset])
@@ -411,51 +478,79 @@ def main():
         f"steps_per_epoch (optimizer steps): {steps_per_epoch}",
         flush=True,
     )
-    ## Going to try weighting the loss of the positives. 
-    pos = len(pos_dataset)
-    neg = len(neg_dataset)
-    # w_pos = math.sqrt(neg / max(pos, 1))
-    w_pos = neg / max(pos, 1)
-    class_weight = torch.tensor([1.0, w_pos], dtype=torch.float)
-    print(f"Class weights for loss: {class_weight.numpy()}", flush=True)
+    train_labels = np.concatenate(
+        [
+            pos_dataset.df["label"].to_numpy(dtype=np.int64),
+            neg_dataset.df["label"].to_numpy(dtype=np.int64),
+        ]
+    )
+    class_counts = np.bincount(train_labels, minlength=2)
+    inv_class_weights = np.zeros(2, dtype=np.float64)
+    for cls_idx, count in enumerate(class_counts):
+        if count > 0:
+            inv_class_weights[cls_idx] = 1.0 / float(count)
+    train_sample_weights = torch.tensor(inv_class_weights[train_labels], dtype=torch.double)
+    logger.info(
+        "Balanced sampler configured with class counts=%s and inverse weights=%s",
+        class_counts.tolist(),
+        inv_class_weights.tolist(),
+    )
 
     class BalancedTrainer(transformers.Trainer):
-        def __init__(self, *args, class_weight=None, test_dataset=None, **kwargs):
+        def __init__(self, *args, train_sample_weights=None, test_dataset=None, **kwargs):
             super().__init__(*args, **kwargs)
-            self.class_weight = class_weight  # tensor([w_neg, w_pos]) or None
+            self.train_sample_weights = train_sample_weights
             self.test_dataset = test_dataset
+            # [CODEX CHANGE 2026-02-27] Track per-trial peak/final eval AUPRC for HPO objective reporting.
+            self.hpo_peak_eval_auprc = None
+            self.hpo_peak_step = None
+            self.hpo_final_eval_auprc = None
         
+
+        # [CODEX CHANGE 2026-02-27] Use trial-scoped TensorBoard directories.
+        def _hp_search_setup(self, trial):
+            super()._hp_search_setup(trial)
+            if self.hp_search_backend is None or trial is None:
+                return
+            trial_number = getattr(trial, 'number', None)
+            if trial_number is None:
+                return
+
+            # Close previous TensorBoard writer so the next trial uses its own log dir.
+            for callback in self.callback_handler.callbacks:
+                if hasattr(callback, 'tb_writer') and callback.tb_writer is not None:
+                    try:
+                        callback.tb_writer.close()
+                    except Exception:
+                        pass
+                    callback.tb_writer = None
+
+            run_dir = os.path.join(self.args.output_dir, f'run-{trial_number}')
+            tb_dir = os.path.join(run_dir, 'tb')
+            os.makedirs(tb_dir, exist_ok=True)
+            self.args.logging_dir = tb_dir
+            self.hpo_peak_eval_auprc = None
+            self.hpo_peak_step = None
+            self.hpo_final_eval_auprc = None
+            logger.info('HPO trial %s TensorBoard log dir: %s', trial_number, tb_dir)
+
         def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None, **kwargs):
             labels = inputs["labels"]
             outputs = model(**{k: v for k, v in inputs.items() if k != "labels"})
-            ## changing from below, because maybe I should not mutate the dict?
-            # labels = inputs.pop("labels")
-            # outputs = model(**inputs)
             logits = outputs.logits
-
-            # w = None
-            if self.class_weight is not None:
-                w = self.class_weight.to(logits.device, dtype=torch.float32)
-            else:
-                w = None
-            
-            # loss = F.cross_entropy(logits.view(-1, model.config.num_labels), labels.view(-1), weight=w)
-            loss = F.cross_entropy(logits, labels, weight=w)
+            loss = F.cross_entropy(logits, labels)
             return (loss, outputs) if return_outputs else loss
 
-        # def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
-        #     # build the same sampler you used before
-        #     labels = torch.tensor(
-        #         pd.concat([pos_dataset.df["label"], neg_dataset.df["label"]]).values
-        #     )
-        #     class_sample_count = torch.tensor(
-        #         [(labels == t).sum() for t in torch.unique(labels, sorted=True)]
-        #     )
-        #     weights = 1.0 / class_sample_count.float()
-        #     sample_weights = weights[labels]
-        #     return torch.utils.data.WeightedRandomSampler(
-        #         sample_weights, num_samples=len(sample_weights), replacement=True
-        #     )
+        def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
+            if self.args.world_size > 1:
+                return super()._get_train_sampler()
+            if self.train_sample_weights is None:
+                return super()._get_train_sampler()
+            return WeightedRandomSampler(
+                self.train_sample_weights,
+                num_samples=len(self.train_sample_weights),
+                replacement=True,
+            )
 
         def create_scheduler(self, num_training_steps: int, optimizer=None):
             """
@@ -507,6 +602,18 @@ def main():
             #         self.log({"train_auprc": train_auprc})
             #         eval_metrics["train_auprc"] = train_auprc
 
+            # [CODEX CHANGE 2026-02-27] Track running peak eval_auprc and expose it to Optuna objective.
+            if metric_key_prefix == "eval":
+                eval_auprc = eval_metrics.get("eval_auprc")
+                if eval_auprc is not None:
+                    self.hpo_final_eval_auprc = float(eval_auprc)
+                    if self.hpo_peak_eval_auprc is None or eval_auprc > self.hpo_peak_eval_auprc:
+                        self.hpo_peak_eval_auprc = float(eval_auprc)
+                        self.hpo_peak_step = int(self.state.global_step)
+                    eval_metrics["eval_auprc_peak"] = self.hpo_peak_eval_auprc
+                    eval_metrics["eval_auprc_peak_step"] = float(self.hpo_peak_step)
+                    eval_metrics["eval_auprc_final"] = self.hpo_final_eval_auprc
+
             if metric_key_prefix == "eval" and self.test_dataset is not None:
                 test_metrics = self.predict(
                     self.test_dataset,
@@ -555,74 +662,176 @@ def main():
         }
 
 
-    def hp_space(trial):
-        # Tune CyclicLR
-        base_lr = trial.suggest_float("base_lr", 1e-8, 5e-7, log=True)
-        max_lr = trial.suggest_float("max_lr", base_lr * 5.0, base_lr * 200.0, log=True)
-        cycle_steps_up = trial.suggest_int("cycle_steps_up", 500, 4000, step=250)
-        cycle_steps_down = trial.suggest_int("cycle_steps_down", 500, 8000, step=250)
-        cycle_gamma = trial.suggest_float("cycle_gamma", 0.9995, 0.99999)
+    # [CODEX CHANGE 2026-02-27] Helpers for study-level reporting and per-trial summaries.
+    def _checkpoint_step_from_path(path_value: Optional[str]) -> Optional[int]:
+        if not path_value or 'checkpoint-' not in str(path_value):
+            return None
+        try:
+            return int(str(path_value).rsplit('checkpoint-', 1)[1])
+        except Exception:
+            return None
 
+    # [CODEX CHANGE 2026-02-27] Read the latest trainer_state for a run directory.
+    def _latest_trainer_state_path(run_dir: str) -> Optional[str]:
+        if not os.path.isdir(run_dir):
+            return None
+        latest_step = -1
+        latest_state_path = None
+        for name in os.listdir(run_dir):
+            if not name.startswith('checkpoint-'):
+                continue
+            try:
+                step = int(name.split('-', 1)[1])
+            except Exception:
+                continue
+            state_path = os.path.join(run_dir, name, 'trainer_state.json')
+            if step > latest_step and os.path.exists(state_path):
+                latest_step = step
+                latest_state_path = state_path
+        return latest_state_path
+
+    # [CODEX CHANGE 2026-02-27] Extract final/peak metrics from trainer_state.json.
+    def _extract_run_metrics(run_dir: str) -> Dict[str, Any]:
+        out = {
+            'peak_eval_auprc': None,
+            'peak_step': None,
+            'final_eval_auprc': None,
+            'best_checkpoint': None,
+        }
+        state_path = _latest_trainer_state_path(run_dir)
+        if state_path is None:
+            return out
+
+        with open(state_path) as f:
+            state = json.load(f)
+
+        out['best_checkpoint'] = state.get('best_model_checkpoint')
+        out['peak_eval_auprc'] = state.get('best_metric')
+        out['peak_step'] = _checkpoint_step_from_path(out['best_checkpoint'])
+
+        eval_history = [entry for entry in state.get('log_history', []) if 'eval_auprc' in entry]
+        if eval_history:
+            out['final_eval_auprc'] = eval_history[-1].get('eval_auprc')
+            if out['peak_eval_auprc'] is None:
+                best_entry = max(eval_history, key=lambda x: x.get('eval_auprc', float('-inf')))
+                out['peak_eval_auprc'] = best_entry.get('eval_auprc')
+            if out['peak_step'] is None and out['peak_eval_auprc'] is not None:
+                best_entry = max(eval_history, key=lambda x: x.get('eval_auprc', float('-inf')))
+                out['peak_step'] = best_entry.get('step')
+
+        return out
+
+    # [CODEX CHANGE 2026-02-27] Single-objective Optuna helper.
+    def _trial_objective_value(trial: optuna.trial.FrozenTrial) -> Optional[float]:
+        if trial.values is None or len(trial.values) == 0:
+            return None
+        return trial.values[0]
+
+    # [CODEX CHANGE 2026-02-27] Study-level CSV plus per-run JSON summaries.
+    def write_study_trial_metrics(study: optuna.Study, output_dir: str):
+        csv_path = os.path.join(output_dir, 'trial_metrics.csv')
+        fieldnames = [
+            'trial_number',
+            'state',
+            'objective',
+            'peak_eval_auprc',
+            'peak_step',
+            'final_eval_auprc',
+            'best_checkpoint',
+            'retry_of_trial',
+        ]
+
+        with open(csv_path, 'w', newline='') as csv_file:
+            writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+            writer.writeheader()
+
+            for trial in sorted(study.get_trials(deepcopy=False), key=lambda t: t.number):
+                run_dir = os.path.join(output_dir, f'run-{trial.number}')
+                run_metrics = _extract_run_metrics(run_dir)
+                row = {
+                    'trial_number': trial.number,
+                    'state': trial.state.name,
+                    'objective': _trial_objective_value(trial),
+                    'peak_eval_auprc': run_metrics['peak_eval_auprc'],
+                    'peak_step': run_metrics['peak_step'],
+                    'final_eval_auprc': run_metrics['final_eval_auprc'],
+                    'best_checkpoint': run_metrics['best_checkpoint'],
+                    'retry_of_trial': trial.user_attrs.get('retry_of_trial', ''),
+                }
+                writer.writerow(row)
+
+                if os.path.isdir(run_dir):
+                    trial_summary = dict(row)
+                    trial_summary['params'] = dict(trial.params)
+                    trial_summary['user_attrs'] = dict(trial.user_attrs)
+                    trial_summary['system_attrs_keys'] = sorted(trial.system_attrs.keys())
+                    with open(os.path.join(run_dir, 'trial_summary.json'), 'w') as f:
+                        json.dump(trial_summary, f, indent=2)
+
+
+    def hp_space(trial):
         return {
-            "use_cyclic_lr": True,
-            "learning_rate": base_lr,
-            "base_lr": base_lr,
-            "max_lr": max_lr,
-            "cycle_steps_up": cycle_steps_up,
-            "cycle_steps_down": cycle_steps_down,
-            "cycle_gamma": cycle_gamma,
+            "hidden_dropout_prob": trial.suggest_float("hidden_dropout_prob", 0.0, 0.7),
+            "conv_dropout_p": trial.suggest_float("conv_dropout_p", 0.0, 0.7),
+            "learning_rate": trial.suggest_float("learning_rate", 1e-6, 1e-3, log=True),
+            # "lr_scheduler_type": trial.suggest_categorical(
+            #     "lr_scheduler_type", ["cosine", "linear", "constant"]
+            # ),
+            "warmup_steps": 0,
+            "warmup_ratio": 0.0,
+            "use_cyclic_lr": False,
         }
 
     # choose *one* metric to optimise for hyperparameter search
     def objective(metrics: Dict[str, float]) -> float:
-        return metrics["eval_loss"]
-        # return metrics["auprc"]        # change if you prefer auroc/accuracy
+        # [CODEX CHANGE 2026-02-27] Old behavior kept for reference:
+        # return metrics["eval_auprc"]
+        # New behavior: optimize peak eval_auprc observed during the trial.
+        if "eval_auprc_peak" in metrics:
+            return metrics["eval_auprc_peak"]
+        return metrics["eval_auprc"]
+
+    def assigned_trials_for_worker(total_trials, worker_count, worker_index):
+        base = total_trials // worker_count
+        remainder = total_trials % worker_count
+        return base + (1 if worker_index < remainder else 0)
+
+    # [CODEX CHANGE 2026-02-27] Normalize output path so run-*/tb/trial_summary paths are stable.
+    # os.makedirs(training_args.output_dir, exist_ok=True)
+    hpo_output_dir = os.path.abspath(training_args.output_dir)
+    training_args.output_dir = hpo_output_dir
+    os.makedirs(training_args.output_dir, exist_ok=True)
 
     # Does this log to slurm? (yes! but adding a file handler too)
     optuna.logging.set_verbosity(optuna.logging.INFO)
-    log_path = os.path.join(training_args.output_dir, "optuna_trials.log")
+    log_path = os.path.join(
+        training_args.output_dir, f"optuna_trials_worker{model_args.hpo_worker_index}.log"
+    )
     fh = logging.FileHandler(log_path, mode="a")
     fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     optuna.logging.get_logger("optuna").addHandler(fh)
 
-    hf_args = training_args # redefining it was a mistake.... caused some problems.
-    # hf_args = TrainingArguments(
-    #     output_dir           = training_args.output_dir,
-    #     overwrite_output_dir = True,
-    #     num_train_epochs     = training_args.num_train_epochs,
-    #     per_device_train_batch_size = training_args.per_device_train_batch_size,
-    #     per_device_eval_batch_size  = training_args.per_device_eval_batch_size,
-    #     eval_strategy        = training_args.eval_strategy,
-    #     eval_steps           = training_args.eval_steps,
-    #     save_steps           = training_args.save_steps,
-    #     save_total_limit     = training_args.save_total_limit,
-    #     learning_rate        = training_args.learning_rate,
-    #     warmup_steps         = training_args.warmup_steps,
-    #     logging_dir          = os.path.join(training_args.output_dir, "logs"),
-    #     logging_steps        = training_args.logging_steps,
-    #     load_best_model_at_end = True,
-    #     metric_for_best_model  = training_args.metric_for_best_model,
-    #     report_to            = ["tensorboard"],
-    #     fp16                 = training_args.fp16,
-    #     optim                = training_args.optim,
-    #     weight_decay         = training_args.weight_decay,
-    # )
+    hf_args = training_args
 
-    def model_init():
+    def model_init(trial=None):
         """
         Return a *new* instance of the model each time Optuna asks
         for a trial.  It must have the *same* initial weights for every
         trial when the seed is fixed, otherwise results aren’t comparable.
         """
-        if model_args.model_name_or_path is not None and model_args.model_name_or_path.lower() != "none":
-            cfg = AutoConfig.from_pretrained(model_args.model_name_or_path)
-            cfg.num_labels = 2
-            return AutoModelForSequenceClassification.from_pretrained(model_args.model_name_or_path,
-                                                                    config=cfg)
-        else:
-            cfg = CONFIG_MAPPING[model_args.model_type]()
-            cfg.num_labels = 2
-            return AutoModelForSequenceClassification.from_config(cfg)
+        if trial is not None and hasattr(trial, "params"):
+            logger.info("Optuna trial %s params=%s", getattr(trial, "number", "n/a"), trial.params)
+        logger.info(
+            "model_init effective args: hidden_dropout_prob=%.4f conv_dropout_p=%.4f "
+            "learning_rate=%s lr_scheduler_type=%s use_cyclic_lr=%s",
+            hf_args.hidden_dropout_prob,
+            hf_args.conv_dropout_p,
+            hf_args.learning_rate,
+            hf_args.lr_scheduler_type,
+            hf_args.use_cyclic_lr,
+        )
+        _, model = _build_model_with_runtime_config()
+        return model
 
     trainer = BalancedTrainer(
         model_init     = model_init,
@@ -631,42 +840,65 @@ def main():
         eval_dataset   = val_dataset,
         tokenizer      = tokenizer,
         compute_metrics= compute_metrics,
-        class_weight   = class_weight,
+        train_sample_weights=train_sample_weights,
         test_dataset   = test_dataset,
     )
-    
-    os.makedirs(training_args.output_dir, exist_ok=True)
-    # model.save_pretrained(training_args.output_dir)
-    # tokenizer.save_pretrained(training_args.output_dir)
 
-    ## Test the tuning stuff if the flag is set
-        # ----------------------------------------------------------------------------------
     #  HYPER-PARAMETER SEARCH BRANCH
-    # ----------------------------------------------------------------------------------
+    best_run = None
     if model_args.hyperparameter_search:
-        # Prepare Optuna study (SQLite so multiple jobs can resume)
-        study_name = f"optuna_{int(time.time())}"
-        storage    = f"sqlite:///{os.path.join(training_args.output_dir, 'optuna.db')}"
-
-        best_run = trainer.hyperparameter_search(
-            n_trials          = 150,
-            direction         = "minimize",
-            hp_space          = hp_space,
-            compute_objective = objective,
-            backend           = "optuna",
-            study_name       = study_name,
-            storage           = storage,
-            pruner            = HyperbandPruner(
-                min_resource=steps_per_epoch * 3.5,
-                max_resource="auto",
-                reduction_factor=2,
-            ),
-
+        study_name = model_args.hpo_study_name
+        storage = model_args.hpo_storage
+        if storage is None:
+            storage = f"sqlite:///{os.path.abspath(os.path.join(training_args.output_dir, 'optuna.db'))}"
+        worker_trials = assigned_trials_for_worker(
+            model_args.hpo_total_trials,
+            model_args.hpo_worker_count,
+            model_args.hpo_worker_index,
         )
+
+        logger.info(
+            "HPO worker %s/%s assigned_trials=%s total_trials=%s study_name=%s storage=%s",
+            model_args.hpo_worker_index,
+            model_args.hpo_worker_count,
+            worker_trials,
+            model_args.hpo_total_trials,
+            study_name,
+            storage,
+        )
+        print(
+            f"HPO worker {model_args.hpo_worker_index}/{model_args.hpo_worker_count} "
+            f"assigned {worker_trials} trials; study={study_name}; storage={storage}",
+            flush=True,
+        )
+
+        if worker_trials > 0:
+            best_run = trainer.hyperparameter_search(
+                n_trials=worker_trials,
+                direction="maximize",
+                hp_space=hp_space,
+                compute_objective=objective,
+                backend="optuna",
+                study_name=study_name,
+                storage=storage,
+                load_if_exists=True,
+                pruner=HyperbandPruner(
+                    min_resource=max(1, steps_per_epoch),
+                    max_resource="auto",
+                    reduction_factor=2,
+                ),
+            )
+        else:
+            logger.warning(
+                "Worker %s was assigned zero trials and will only summarize shared study state.",
+                model_args.hpo_worker_index,
+            )
 
         # Save study
         study = optuna.load_study(study_name=study_name, storage=storage)
         joblib.dump(study, os.path.join(training_args.output_dir, "optuna_study.pkl"))
+        # [CODEX CHANGE 2026-02-27] Write study-level CSV and per-trial JSON summaries.
+        write_study_trial_metrics(study, training_args.output_dir)
 
         dashboards = {
             "optimization_history": plot_optimization_history(study),
@@ -683,31 +915,90 @@ def main():
             except Exception as e:
                 logger.warning(f"PNG export failed for {name}: {e}")
 
+        state_counts = dict(Counter(trial.state.name for trial in study.trials))
+        try:
+            study_best_value = study.best_value
+            study_best_trial = study.best_trial.number
+            study_best_params = study.best_params
+        except ValueError:
+            study_best_value = None
+            study_best_trial = None
+            study_best_params = {}
+
+        best_payload = {
+            "worker_index": model_args.hpo_worker_index,
+            "worker_count": model_args.hpo_worker_count,
+            "assigned_trials": worker_trials,
+            "study_name": study_name,
+            "storage": storage,
+            "best_run": {
+                "run_id": getattr(best_run, "run_id", None),
+                "objective": getattr(best_run, "objective", None),
+                "hyperparameters": getattr(best_run, "hyperparameters", None),
+            },
+            "study_best": {
+                "trial_number": study_best_trial,
+                "value": study_best_value,
+                "params": study_best_params,
+            },
+        }
+        with open(os.path.join(training_args.output_dir, "hpo_best_params.json"), "w") as f:
+            json.dump(best_payload, f, indent=2)
+
+        summary_payload = {
+            "worker_index": model_args.hpo_worker_index,
+            "worker_count": model_args.hpo_worker_count,
+            "assigned_trials": worker_trials,
+            "requested_total_trials": model_args.hpo_total_trials,
+            "study_name": study_name,
+            "storage": storage,
+            "num_trials_recorded": len(study.trials),
+            "state_counts": state_counts,
+            "best_trial_number": study_best_trial,
+            "best_value": study_best_value,
+            "objective_mode": "peak_eval_auprc",
+        }
+        with open(os.path.join(training_args.output_dir, "hpo_study_summary.json"), "w") as f:
+            json.dump(summary_payload, f, indent=2)
+
+        if study_best_trial is not None:
+            logger.info(
+                "Study best trial=%s objective=%s params=%s",
+                study_best_trial,
+                study_best_value,
+                study_best_params,
+            )
+
+        if not model_args.train_best_after_search:
+            logger.info(
+                "Hyperparameter search complete. train_best_after_search=False, exiting without final training."
+            )
+            return
+
+        from dataclasses import replace
+
+        params_for_final_train = (
+            best_run.hyperparameters if best_run is not None else study_best_params
+        )
+        if not params_for_final_train:
+            raise ValueError("No hyperparameters available to train after search.")
+
+        hf_args = replace(hf_args, **params_for_final_train)
+        training_args = hf_args
         logger.info(
-            f"Best trial run_id={best_run.run_id} "
-            f"objective={best_run.objective:.4f} "
-            f"params={best_run.hyperparameters}"
-            )
-
-        from dataclasses import replace, asdict
-
-        # build a new TrainingArguments object that merges in the tuned params
-        # new_args_dict = asdict(hf_args)
-        # new_args_dict.update(best_run.hyperparameters)
-        # hf_args = TrainingArguments(**new_args_dict) ## fails because some args are not in datasets
-        hf_args = replace(hf_args, **best_run.hyperparameters)
-        # re-initialize the trainer with the new args
-        logger.info("Re-initializing trainer with tuned hyperparameters.")
+            "Re-initializing trainer with tuned hyperparameters for final training. params=%s",
+            params_for_final_train,
+        )
         trainer = BalancedTrainer(
-                model_init     = model_init,
-                args           = hf_args,
-                train_dataset  = train_dataset,
-                eval_dataset   = val_dataset,
-                tokenizer      = tokenizer,
-                compute_metrics= compute_metrics,
-                class_weight   = class_weight,
-                test_dataset   = test_dataset,
-            )
+            model_init=model_init,
+            args=hf_args,
+            train_dataset=train_dataset,
+            eval_dataset=val_dataset,
+            tokenizer=tokenizer,
+            compute_metrics=compute_metrics,
+            train_sample_weights=train_sample_weights,
+            test_dataset=test_dataset,
+        )
     # ----------------------------------------------------------------------------------
     #  NORMAL TRAINING / FINAL TRAIN WITH BEST PARAMS
     # ----------------------------------------------------------------------------------
