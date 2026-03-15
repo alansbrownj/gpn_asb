@@ -5,6 +5,7 @@
 ## Writing this script for sequence classification
 import optuna
 from optuna.pruners import HyperbandPruner
+from optuna.trial import TrialState
 from optuna.visualization import (
     plot_optimization_history,
     plot_param_importances,
@@ -16,6 +17,7 @@ import plotly.io as pio
 import joblib
 
 import csv
+import fcntl
 import logging
 import math
 import json
@@ -23,7 +25,7 @@ import numpy as np
 import os
 import sys
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from itertools import chain
 import torch
 import torch.nn as nn
@@ -58,7 +60,7 @@ from transformers import (
     set_seed,
     get_scheduler,
 )
-from transformers.trainer_utils import get_last_checkpoint
+from transformers.trainer_utils import HPSearchBackend, get_last_checkpoint
 from transformers.utils import check_min_version, send_example_telemetry
 from transformers.utils.versions import require_version
 from transformers.modeling_outputs import SequenceClassifierOutput
@@ -81,6 +83,10 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(name)s - %(message)s", level=logging.INFO
 )
+
+
+class NumericalTrialFailure(RuntimeError):
+    """Raised when a trial produces non-finite tensors or metrics."""
 
 class ParquetClassificationDataset(Dataset):
     def __init__(self, parquet_file: str, tokenizer, max_length: int = 512):
@@ -365,16 +371,16 @@ def main():
     # Load tokenizer and model builder
     tokenizer = AutoTokenizer.from_pretrained(model_args.tokenizer_name)
 
-    def _apply_runtime_config(cfg):
+    def _apply_runtime_config(cfg, runtime_args):
         cfg.num_labels = 2  # binary classification
-        cfg.hidden_dropout_prob = training_args.hidden_dropout_prob
-        setattr(cfg, "conv_dropout_p", training_args.conv_dropout_p)
+        cfg.hidden_dropout_prob = runtime_args.hidden_dropout_prob
+        setattr(cfg, "conv_dropout_p", runtime_args.conv_dropout_p)
         return cfg
 
-    def _build_model_with_runtime_config():
+    def _build_model_with_runtime_config(runtime_args):
         if model_args.model_name_or_path is not None and model_args.model_name_or_path.lower() != "none":
             cfg = AutoConfig.from_pretrained(model_args.model_name_or_path)
-            cfg = _apply_runtime_config(cfg)
+            cfg = _apply_runtime_config(cfg, runtime_args)
             model = AutoModelForSequenceClassification.from_pretrained(
                 model_args.model_name_or_path, config=cfg
             )
@@ -391,7 +397,7 @@ def main():
                 f"Unknown model type: {model_args.model_type}. Available types: {list(CONFIG_MAPPING.keys())}"
             )
         cfg = CONFIG_MAPPING[model_args.model_type]()
-        cfg = _apply_runtime_config(cfg)
+        cfg = _apply_runtime_config(cfg, runtime_args)
         model = AutoModelForSequenceClassification.from_config(cfg)
         logger.info(
             "Initialized model from scratch for %s with hidden_dropout_prob=%.4f conv_dropout_p=%.4f",
@@ -505,7 +511,6 @@ def main():
             self.hpo_peak_eval_auprc = None
             self.hpo_peak_step = None
             self.hpo_final_eval_auprc = None
-        
 
         # [CODEX CHANGE 2026-02-27] Use trial-scoped TensorBoard directories.
         def _hp_search_setup(self, trial):
@@ -534,11 +539,53 @@ def main():
             self.hpo_final_eval_auprc = None
             logger.info('HPO trial %s TensorBoard log dir: %s', trial_number, tb_dir)
 
+        @staticmethod
+        def _tensor_debug_summary(tensor: Optional[Union[torch.Tensor, np.ndarray]]) -> str:
+            if tensor is None:
+                return 'n/a'
+            data = torch.as_tensor(tensor).detach().float().cpu()
+            finite = data[torch.isfinite(data)]
+            min_value = float(finite.min().item()) if finite.numel() else None
+            max_value = float(finite.max().item()) if finite.numel() else None
+            return (
+                f"shape={tuple(data.shape)} finite={int(finite.numel())}/{data.numel()} "
+                f"min={min_value} max={max_value}"
+            )
+
+        def _current_learning_rate(self) -> float:
+            try:
+                learning_rate = self._get_learning_rate()
+                if learning_rate is not None:
+                    return float(learning_rate)
+            except Exception:
+                pass
+            return float(self.args.learning_rate)
+
+        def _raise_numerical_failure(self, reason: str, *, logits=None, probs=None, loss=None):
+            trial = getattr(self, '_trial', None)
+            trial_number = getattr(trial, 'number', 'n/a')
+            message = (
+                f"Trial {trial_number} numerical failure: {reason}; "
+                f"global_step={int(self.state.global_step)}; "
+                f"learning_rate={self._current_learning_rate()}; "
+                f"hidden_dropout_prob={self.args.hidden_dropout_prob}; "
+                f"conv_dropout_p={self.args.conv_dropout_p}; "
+                f"logits={self._tensor_debug_summary(logits)}; "
+                f"probs={self._tensor_debug_summary(probs)}; "
+                f"loss={self._tensor_debug_summary(loss)}"
+            )
+            logger.error(message)
+            raise NumericalTrialFailure(message)
+
         def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None, **kwargs):
             labels = inputs["labels"]
             outputs = model(**{k: v for k, v in inputs.items() if k != "labels"})
             logits = outputs.logits
+            if not torch.isfinite(logits).all():
+                self._raise_numerical_failure("non-finite logits during training", logits=logits)
             loss = F.cross_entropy(logits, labels)
+            if not torch.isfinite(loss).all():
+                self._raise_numerical_failure("non-finite loss during training", logits=logits, loss=loss)
             return (loss, outputs) if return_outputs else loss
 
         def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
@@ -590,18 +637,6 @@ def main():
             if metric_key_prefix == "train":
                 return eval_metrics
 
-            # TRAIN auPRC LOGGING BLOCK (comment out to disable)
-            # if self.train_dataset is not None:
-            #     train_metrics = self.predict(
-            #         self.train_dataset,
-            #         ignore_keys=ignore_keys,
-            #         metric_key_prefix="train",
-            #     ).metrics
-            #     train_auprc = train_metrics.get("train_auprc")
-            #     if train_auprc is not None:
-            #         self.log({"train_auprc": train_auprc})
-            #         eval_metrics["train_auprc"] = train_auprc
-
             # [CODEX CHANGE 2026-02-27] Track running peak eval_auprc and expose it to Optuna objective.
             if metric_key_prefix == "eval":
                 eval_auprc = eval_metrics.get("eval_auprc")
@@ -626,40 +661,6 @@ def main():
                     eval_metrics["test_auprc"] = test_auprc
 
             return eval_metrics
-
-    def compute_metrics(eval_pred):
-        logits, labels = eval_pred
-        labels = np.asarray(labels)
-
-        logits_t = torch.tensor(logits)
-        labels_t = torch.tensor(labels, dtype=torch.long)
-
-        # probs for AUPRC
-        probs = torch.softmax(logits_t, dim=-1).numpy()[:, 1]
-        preds = logits_t.argmax(dim=-1).numpy()
-
-        # per-example cross entropy
-        per_ex_xent = F.cross_entropy(logits_t, labels_t, reduction="none").numpy()
-
-        pos_mask = labels == 1
-        neg_mask = labels == 0
-
-        xent_pos = per_ex_xent[pos_mask].mean() if pos_mask.any() else np.nan
-        xent_neg = per_ex_xent[neg_mask].mean() if neg_mask.any() else np.nan
-        xent_balanced = 0.5 * (xent_pos + xent_neg) if (pos_mask.any() and neg_mask.any()) else np.nan
-
-        pos_frac = labels.mean()
-
-        return {
-            "accuracy": accuracy_score(labels, preds),
-            "auroc": roc_auc_score(labels, probs),
-            "auprc": average_precision_score(labels, probs),
-            "mcc": matthews_corrcoef(labels, preds),
-            "random_auprc": pos_frac,
-            "cross_entropy_pos": xent_pos,
-            "cross_entropy_neg": xent_neg,
-            "cross_entropy_balanced": xent_balanced,
-        }
 
 
     # [CODEX CHANGE 2026-02-27] Helpers for study-level reporting and per-trial summaries.
@@ -791,16 +792,11 @@ def main():
             return metrics["eval_auprc_peak"]
         return metrics["eval_auprc"]
 
-    def assigned_trials_for_worker(total_trials, worker_count, worker_index):
-        base = total_trials // worker_count
-        remainder = total_trials % worker_count
-        return base + (1 if worker_index < remainder else 0)
-
     # [CODEX CHANGE 2026-02-27] Normalize output path so run-*/tb/trial_summary paths are stable.
-    # os.makedirs(training_args.output_dir, exist_ok=True)
     hpo_output_dir = os.path.abspath(training_args.output_dir)
     training_args.output_dir = hpo_output_dir
     os.makedirs(training_args.output_dir, exist_ok=True)
+    base_training_args = replace(training_args)
 
     # Does this log to slurm? (yes! but adding a file handler too)
     optuna.logging.set_verbosity(optuna.logging.INFO)
@@ -811,88 +807,261 @@ def main():
     fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     optuna.logging.get_logger("optuna").addHandler(fh)
 
-    hf_args = training_args
+    def _is_known_numerical_failure(exc: Exception) -> bool:
+        if isinstance(exc, (NumericalTrialFailure, FloatingPointError)):
+            return True
+        if isinstance(exc, ValueError):
+            message = str(exc).lower()
+            if "input contains nan" in message or "input contains infinity" in message:
+                return True
+            if "not finite" in message or "non-finite" in message:
+                return True
+        return False
 
-    def model_init(trial=None):
-        """
-        Return a *new* instance of the model each time Optuna asks
-        for a trial.  It must have the *same* initial weights for every
-        trial when the seed is fixed, otherwise results aren’t comparable.
-        """
-        if trial is not None and hasattr(trial, "params"):
-            logger.info("Optuna trial %s params=%s", getattr(trial, "number", "n/a"), trial.params)
-        logger.info(
-            "model_init effective args: hidden_dropout_prob=%.4f conv_dropout_p=%.4f "
-            "learning_rate=%s lr_scheduler_type=%s use_cyclic_lr=%s",
-            hf_args.hidden_dropout_prob,
-            hf_args.conv_dropout_p,
-            hf_args.learning_rate,
-            hf_args.lr_scheduler_type,
-            hf_args.use_cyclic_lr,
+    def _build_trainer(run_args):
+        trainer_holder: Dict[str, BalancedTrainer] = {}
+
+        def compute_metrics(eval_pred):
+            trainer = trainer_holder["trainer"]
+            logits, labels = eval_pred
+            labels = np.asarray(labels)
+
+            logits_t = torch.as_tensor(logits, dtype=torch.float32)
+            labels_t = torch.tensor(labels, dtype=torch.long)
+
+            if not torch.isfinite(logits_t).all():
+                trainer._raise_numerical_failure("non-finite logits during evaluation", logits=logits_t)
+
+            probs_t = torch.softmax(logits_t, dim=-1)
+            if not torch.isfinite(probs_t).all():
+                trainer._raise_numerical_failure(
+                    "non-finite probabilities during evaluation", logits=logits_t, probs=probs_t
+                )
+
+            per_ex_xent_t = F.cross_entropy(logits_t, labels_t, reduction="none")
+            if not torch.isfinite(per_ex_xent_t).all():
+                trainer._raise_numerical_failure(
+                    "non-finite per-example cross entropy during evaluation",
+                    logits=logits_t,
+                    probs=probs_t,
+                    loss=per_ex_xent_t,
+                )
+
+            probs = probs_t.cpu().numpy()[:, 1]
+            preds = logits_t.argmax(dim=-1).cpu().numpy()
+            per_ex_xent = per_ex_xent_t.cpu().numpy()
+
+            pos_mask = labels == 1
+            neg_mask = labels == 0
+
+            xent_pos = per_ex_xent[pos_mask].mean() if pos_mask.any() else np.nan
+            xent_neg = per_ex_xent[neg_mask].mean() if neg_mask.any() else np.nan
+            xent_balanced = 0.5 * (xent_pos + xent_neg) if (pos_mask.any() and neg_mask.any()) else np.nan
+
+            pos_frac = labels.mean()
+
+            return {
+                "accuracy": accuracy_score(labels, preds),
+                "auroc": roc_auc_score(labels, probs),
+                "auprc": average_precision_score(labels, probs),
+                "mcc": matthews_corrcoef(labels, preds),
+                "random_auprc": pos_frac,
+                "cross_entropy_pos": xent_pos,
+                "cross_entropy_neg": xent_neg,
+                "cross_entropy_balanced": xent_balanced,
+            }
+
+        def model_init(trial=None):
+            if trial is not None and hasattr(trial, "params"):
+                logger.info("Optuna trial %s params=%s", getattr(trial, "number", "n/a"), trial.params)
+            logger.info(
+                "model_init effective args: hidden_dropout_prob=%.4f conv_dropout_p=%.4f "
+                "learning_rate=%s lr_scheduler_type=%s use_cyclic_lr=%s",
+                run_args.hidden_dropout_prob,
+                run_args.conv_dropout_p,
+                run_args.learning_rate,
+                run_args.lr_scheduler_type,
+                run_args.use_cyclic_lr,
+            )
+            _, model = _build_model_with_runtime_config(run_args)
+            return model
+
+        trainer = BalancedTrainer(
+            model_init=model_init,
+            args=run_args,
+            train_dataset=train_dataset,
+            eval_dataset=val_dataset,
+            tokenizer=tokenizer,
+            compute_metrics=compute_metrics,
+            train_sample_weights=train_sample_weights,
+            test_dataset=test_dataset,
         )
-        _, model = _build_model_with_runtime_config()
-        return model
+        trainer_holder["trainer"] = trainer
+        return trainer
 
-    trainer = BalancedTrainer(
-        model_init     = model_init,
-        args           = hf_args,
-        train_dataset  = train_dataset,
-        eval_dataset   = val_dataset,
-        tokenizer      = tokenizer,
-        compute_metrics= compute_metrics,
-        train_sample_weights=train_sample_weights,
-        test_dataset   = test_dataset,
-    )
+    def _cleanup_trainer(trainer):
+        if trainer is None:
+            return
+        try:
+            from accelerate.utils.memory import release_memory
+
+            trainer.model_wrapped, trainer.model = release_memory(trainer.model_wrapped, trainer.model)
+        except Exception:
+            pass
+        try:
+            trainer.accelerator.clear()
+        except Exception:
+            pass
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    def _create_or_load_study(study_name: str, storage: str) -> optuna.Study:
+        return optuna.create_study(
+            direction="maximize",
+            study_name=study_name,
+            storage=storage,
+            load_if_exists=True,
+            pruner=HyperbandPruner(
+                min_resource=max(1, steps_per_epoch),
+                max_resource="auto",
+                reduction_factor=2,
+            ),
+        )
+
+    counted_trial_states = {TrialState.RUNNING, TrialState.COMPLETE, TrialState.PRUNED, TrialState.FAIL}
+    terminal_trial_states = {TrialState.COMPLETE, TrialState.PRUNED, TrialState.FAIL}
+    claim_lock_path = os.path.join(training_args.output_dir, "optuna_claim.lock")
+
+    def _claim_next_hpo_trial(study_name: str, storage: str):
+        with open(claim_lock_path, "a+") as lock_handle:
+            fcntl.flock(lock_handle, fcntl.LOCK_EX)
+            study = _create_or_load_study(study_name, storage)
+            trials = study.get_trials(deepcopy=False)
+            counted_trials = sum(1 for trial in trials if trial.state in counted_trial_states)
+            terminal_trials = sum(1 for trial in trials if trial.state in terminal_trial_states)
+            if counted_trials >= model_args.hpo_total_trials:
+                return None, None, terminal_trials, counted_trials
+
+            trial = study.ask()
+            trial.set_user_attr("worker_index", model_args.hpo_worker_index)
+            trial.set_user_attr("worker_pid", os.getpid())
+            logger.info(
+                "HPO worker %s/%s claimed trial %s counted=%s/%s terminal=%s",
+                model_args.hpo_worker_index,
+                model_args.hpo_worker_count,
+                trial.number,
+                counted_trials + 1,
+                model_args.hpo_total_trials,
+                terminal_trials,
+            )
+            return study, trial, terminal_trials, counted_trials + 1
+
+    trainer = None
 
     #  HYPER-PARAMETER SEARCH BRANCH
-    best_run = None
     if model_args.hyperparameter_search:
         study_name = model_args.hpo_study_name
         storage = model_args.hpo_storage
         if storage is None:
             storage = f"sqlite:///{os.path.abspath(os.path.join(training_args.output_dir, 'optuna.db'))}"
-        worker_trials = assigned_trials_for_worker(
-            model_args.hpo_total_trials,
-            model_args.hpo_worker_count,
-            model_args.hpo_worker_index,
-        )
 
         logger.info(
-            "HPO worker %s/%s assigned_trials=%s total_trials=%s study_name=%s storage=%s",
+            "HPO worker %s/%s using dynamic shared scheduling total_trials=%s study_name=%s storage=%s",
             model_args.hpo_worker_index,
             model_args.hpo_worker_count,
-            worker_trials,
             model_args.hpo_total_trials,
             study_name,
             storage,
         )
         print(
             f"HPO worker {model_args.hpo_worker_index}/{model_args.hpo_worker_count} "
-            f"assigned {worker_trials} trials; study={study_name}; storage={storage}",
+            f"using dynamic shared scheduling; total_trials={model_args.hpo_total_trials}; "
+            f"study={study_name}; storage={storage}",
             flush=True,
         )
 
-        if worker_trials > 0:
-            best_run = trainer.hyperparameter_search(
-                n_trials=worker_trials,
-                direction="maximize",
-                hp_space=hp_space,
-                compute_objective=objective,
-                backend="optuna",
-                study_name=study_name,
-                storage=storage,
-                load_if_exists=True,
-                pruner=HyperbandPruner(
-                    min_resource=max(1, steps_per_epoch),
-                    max_resource="auto",
-                    reduction_factor=2,
-                ),
-            )
-        else:
-            logger.warning(
-                "Worker %s was assigned zero trials and will only summarize shared study state.",
-                model_args.hpo_worker_index,
-            )
+        claimed_trials = 0
+        completed_trials = 0
+        pruned_trials = 0
+        failed_trials = 0
+
+        while True:
+            study, trial, terminal_trials, counted_trials = _claim_next_hpo_trial(study_name, storage)
+            if trial is None:
+                logger.info(
+                    "HPO worker %s/%s found no remaining unclaimed trials. terminal=%s counted=%s target=%s",
+                    model_args.hpo_worker_index,
+                    model_args.hpo_worker_count,
+                    terminal_trials,
+                    counted_trials,
+                    model_args.hpo_total_trials,
+                )
+                break
+
+            claimed_trials += 1
+            trainer = None
+            try:
+                trainer = _build_trainer(replace(base_training_args))
+                trainer.hp_search_backend = HPSearchBackend.OPTUNA
+                trainer.hp_space = hp_space
+                trainer.compute_objective = objective
+                trainer.objective = None
+
+                trainer.train(resume_from_checkpoint=None, trial=trial)
+                if getattr(trainer, "objective", None) is None:
+                    metrics = trainer.evaluate()
+                    trainer.objective = trainer.compute_objective(metrics)
+
+                if trainer.objective is None:
+                    raise NumericalTrialFailure(f"Trial {trial.number} did not produce an objective value.")
+
+                objective_value = float(trainer.objective)
+                if not math.isfinite(objective_value):
+                    raise NumericalTrialFailure(
+                        f"Trial {trial.number} produced non-finite objective {objective_value}."
+                    )
+
+                study.tell(trial, objective_value, state=TrialState.COMPLETE)
+                completed_trials += 1
+                logger.info(
+                    "Worker %s/%s completed trial %s objective=%s params=%s",
+                    model_args.hpo_worker_index,
+                    model_args.hpo_worker_count,
+                    trial.number,
+                    objective_value,
+                    trial.params,
+                )
+            except optuna.TrialPruned as exc:
+                trial.set_user_attr("trial_outcome", "PRUNED")
+                trial.set_user_attr("pruned_reason", str(exc))
+                study.tell(trial, state=TrialState.PRUNED)
+                pruned_trials += 1
+                logger.info(
+                    "Worker %s/%s pruned trial %s params=%s reason=%s",
+                    model_args.hpo_worker_index,
+                    model_args.hpo_worker_count,
+                    trial.number,
+                    trial.params,
+                    exc,
+                )
+            except Exception as exc:
+                if trial is not None and _is_known_numerical_failure(exc):
+                    trial.set_user_attr("trial_outcome", "FAIL")
+                    trial.set_user_attr("failure_reason", str(exc)[:2000])
+                    study.tell(trial, state=TrialState.FAIL)
+                    failed_trials += 1
+                    logger.warning(
+                        "Worker %s/%s marked trial %s as FAIL due to numerical issue: %s",
+                        model_args.hpo_worker_index,
+                        model_args.hpo_worker_count,
+                        trial.number,
+                        exc,
+                    )
+                else:
+                    raise
+            finally:
+                _cleanup_trainer(trainer)
+                trainer = None
 
         # Save study
         study = optuna.load_study(study_name=study_name, storage=storage)
@@ -900,20 +1069,24 @@ def main():
         # [CODEX CHANGE 2026-02-27] Write study-level CSV and per-trial JSON summaries.
         write_study_trial_metrics(study, training_args.output_dir)
 
-        dashboards = {
-            "optimization_history": plot_optimization_history(study),
-            "param_importances":    plot_param_importances(study),
-            "parallel_coordinate":  plot_parallel_coordinate(study),
+        dashboard_builders = {
+            "optimization_history": plot_optimization_history,
+            "param_importances": plot_param_importances,
+            "parallel_coordinate": plot_parallel_coordinate,
         }
-        for name, fig in dashboards.items():
-            html_path = os.path.join(training_args.output_dir, f"{name}.html")
-            fig.write_html(html_path)
-            # optional PNG (needs `pip install kaleido` which is in my "deep" conda env)
+        for name, build_figure in dashboard_builders.items():
             try:
-                png_path = os.path.join(training_args.output_dir, f"{name}.png")
-                pio.write_image(fig, png_path, format="png", width=1000, height=600)
+                fig = build_figure(study)
+                html_path = os.path.join(training_args.output_dir, f"{name}.html")
+                fig.write_html(html_path)
+                # optional PNG (needs `pip install kaleido` which is in my "deep" conda env)
+                try:
+                    png_path = os.path.join(training_args.output_dir, f"{name}.png")
+                    pio.write_image(fig, png_path, format="png", width=1000, height=600)
+                except Exception as e:
+                    logger.warning(f"PNG export failed for {name}: {e}")
             except Exception as e:
-                logger.warning(f"PNG export failed for {name}: {e}")
+                logger.warning(f"Dashboard export failed for {name}: {e}")
 
         state_counts = dict(Counter(trial.state.name for trial in study.trials))
         try:
@@ -928,13 +1101,16 @@ def main():
         best_payload = {
             "worker_index": model_args.hpo_worker_index,
             "worker_count": model_args.hpo_worker_count,
-            "assigned_trials": worker_trials,
+            "claimed_trials": claimed_trials,
+            "completed_trials": completed_trials,
+            "pruned_trials": pruned_trials,
+            "failed_trials": failed_trials,
             "study_name": study_name,
             "storage": storage,
             "best_run": {
-                "run_id": getattr(best_run, "run_id", None),
-                "objective": getattr(best_run, "objective", None),
-                "hyperparameters": getattr(best_run, "hyperparameters", None),
+                "run_id": str(study_best_trial) if study_best_trial is not None else None,
+                "objective": study_best_value,
+                "hyperparameters": study_best_params,
             },
             "study_best": {
                 "trial_number": study_best_trial,
@@ -948,7 +1124,10 @@ def main():
         summary_payload = {
             "worker_index": model_args.hpo_worker_index,
             "worker_count": model_args.hpo_worker_count,
-            "assigned_trials": worker_trials,
+            "claimed_trials": claimed_trials,
+            "completed_trials": completed_trials,
+            "pruned_trials": pruned_trials,
+            "failed_trials": failed_trials,
             "requested_total_trials": model_args.hpo_total_trials,
             "study_name": study_name,
             "storage": storage,
@@ -975,30 +1154,19 @@ def main():
             )
             return
 
-        from dataclasses import replace
+        if not study_best_params:
+            raise ValueError("No completed hyperparameter trial is available for final training.")
 
-        params_for_final_train = (
-            best_run.hyperparameters if best_run is not None else study_best_params
-        )
-        if not params_for_final_train:
-            raise ValueError("No hyperparameters available to train after search.")
-
-        hf_args = replace(hf_args, **params_for_final_train)
-        training_args = hf_args
+        training_args = replace(base_training_args, **study_best_params)
         logger.info(
             "Re-initializing trainer with tuned hyperparameters for final training. params=%s",
-            params_for_final_train,
+            study_best_params,
         )
-        trainer = BalancedTrainer(
-            model_init=model_init,
-            args=hf_args,
-            train_dataset=train_dataset,
-            eval_dataset=val_dataset,
-            tokenizer=tokenizer,
-            compute_metrics=compute_metrics,
-            train_sample_weights=train_sample_weights,
-            test_dataset=test_dataset,
-        )
+        trainer = _build_trainer(training_args)
+    else:
+        training_args = replace(base_training_args)
+        trainer = _build_trainer(training_args)
+
     # ----------------------------------------------------------------------------------
     #  NORMAL TRAINING / FINAL TRAIN WITH BEST PARAMS
     # ----------------------------------------------------------------------------------
@@ -1010,6 +1178,7 @@ def main():
     logger.info("Training complete and model saved.")
     best_ckpt = trainer.state.best_model_checkpoint
     logger.info(f"best checkpoint on disk: {best_ckpt}")      # e.g. .../checkpoint-4500
+
 
 if __name__ == "__main__":
     main()
