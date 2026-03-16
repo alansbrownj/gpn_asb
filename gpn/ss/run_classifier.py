@@ -339,6 +339,14 @@ class CustomTrainingArguments(TrainingArguments):
         default=0.35,
         metadata={"help": "Dropout probability for ConvLayer residual dropout."},
     )
+    lstm_pool_size: int = field(
+        default=4,
+        metadata={"help": "MaxPool1d kernel size applied before the LSTM classification head."},
+    )
+    lstm_pool_stride: int = field(
+        default=4,
+        metadata={"help": "MaxPool1d stride applied before the LSTM classification head."},
+    )
 
 # ----- Main training function ----- #
 def main():
@@ -375,6 +383,9 @@ def main():
         cfg.num_labels = 2  # binary classification
         cfg.hidden_dropout_prob = runtime_args.hidden_dropout_prob
         setattr(cfg, "conv_dropout_p", runtime_args.conv_dropout_p)
+        setattr(cfg, "seq_len", data_args.max_seq_length)
+        setattr(cfg, "lstm_pool_size", runtime_args.lstm_pool_size)
+        setattr(cfg, "lstm_pool_stride", runtime_args.lstm_pool_stride)
         return cfg
 
     def _build_model_with_runtime_config(runtime_args):
@@ -728,6 +739,14 @@ def main():
             return None
         return trial.values[0]
 
+    def _normalize_hpo_params(params: Dict[str, Any]) -> Dict[str, Any]:
+        normalized = dict(params)
+        pool_size = normalized.get("lstm_pool_size")
+        stride_divisor = normalized.pop("lstm_pool_stride_divisor", None)
+        if pool_size is not None and stride_divisor is not None:
+            normalized["lstm_pool_stride"] = int(pool_size) // int(stride_divisor)
+        return normalized
+
     # [CODEX CHANGE 2026-02-27] Study-level CSV plus per-run JSON summaries.
     def write_study_trial_metrics(study: optuna.Study, output_dir: str):
         csv_path = os.path.join(output_dir, 'trial_metrics.csv')
@@ -763,7 +782,7 @@ def main():
 
                 if os.path.isdir(run_dir):
                     trial_summary = dict(row)
-                    trial_summary['params'] = dict(trial.params)
+                    trial_summary['params'] = _normalize_hpo_params(trial.params)
                     trial_summary['user_attrs'] = dict(trial.user_attrs)
                     trial_summary['system_attrs_keys'] = sorted(trial.system_attrs.keys())
                     with open(os.path.join(run_dir, 'trial_summary.json'), 'w') as f:
@@ -771,10 +790,16 @@ def main():
 
 
     def hp_space(trial):
+        lstm_pool_size = trial.suggest_categorical("lstm_pool_size", [2, 4, 8, 16])
+        lstm_pool_stride = lstm_pool_size // trial.suggest_categorical(
+            "lstm_pool_stride_divisor", [1, 2]
+        )
         return {
             "hidden_dropout_prob": trial.suggest_float("hidden_dropout_prob", 0.0, 0.7),
             "conv_dropout_p": trial.suggest_float("conv_dropout_p", 0.0, 0.7),
             "learning_rate": trial.suggest_float("learning_rate", 1e-6, 1e-3, log=True),
+            "lstm_pool_size": lstm_pool_size,
+            "lstm_pool_stride": lstm_pool_stride,
             # "lr_scheduler_type": trial.suggest_categorical(
             #     "lr_scheduler_type", ["cosine", "linear", "constant"]
             # ),
@@ -876,9 +901,11 @@ def main():
                 logger.info("Optuna trial %s params=%s", getattr(trial, "number", "n/a"), trial.params)
             logger.info(
                 "model_init effective args: hidden_dropout_prob=%.4f conv_dropout_p=%.4f "
-                "learning_rate=%s lr_scheduler_type=%s use_cyclic_lr=%s",
+                "lstm_pool_size=%s lstm_pool_stride=%s learning_rate=%s lr_scheduler_type=%s use_cyclic_lr=%s",
                 run_args.hidden_dropout_prob,
                 run_args.conv_dropout_p,
+                run_args.lstm_pool_size,
+                run_args.lstm_pool_stride,
                 run_args.learning_rate,
                 run_args.lr_scheduler_type,
                 run_args.use_cyclic_lr,
@@ -1029,7 +1056,7 @@ def main():
                     model_args.hpo_worker_count,
                     trial.number,
                     objective_value,
-                    trial.params,
+                    _normalize_hpo_params(trial.params),
                 )
             except optuna.TrialPruned as exc:
                 trial.set_user_attr("trial_outcome", "PRUNED")
@@ -1092,7 +1119,7 @@ def main():
         try:
             study_best_value = study.best_value
             study_best_trial = study.best_trial.number
-            study_best_params = study.best_params
+            study_best_params = _normalize_hpo_params(study.best_params)
         except ValueError:
             study_best_value = None
             study_best_trial = None

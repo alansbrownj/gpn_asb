@@ -131,30 +131,48 @@ class LSTMClassificationHead(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
-        self.dropout = nn.Dropout(config.hidden_dropout_prob)
-        self.out_proj = nn.Linear(config.hidden_size, config.num_labels)
-
         self.config = config
+        if config.seq_len <= 0:
+            raise ValueError(f"seq_len must be > 0, got {config.seq_len}")
+        if config.lstm_pool_size <= 0:
+            raise ValueError(f"lstm_pool_size must be > 0, got {config.lstm_pool_size}")
+        if config.lstm_pool_stride <= 0:
+            raise ValueError(f"lstm_pool_stride must be > 0, got {config.lstm_pool_stride}")
+
+        lstm_reduced_len = ((config.seq_len - config.lstm_pool_size) // config.lstm_pool_stride) + 1
+        if lstm_reduced_len <= 0:
+            raise ValueError(
+                "Invalid LSTM pooling configuration: "
+                f"seq_len={config.seq_len}, "
+                f"lstm_pool_size={config.lstm_pool_size}, "
+                f"lstm_pool_stride={config.lstm_pool_stride}"
+            )
+
+        flatten_dim = lstm_reduced_len * config.hidden_size
+        self.pre_lstm_pool = nn.MaxPool1d(
+            kernel_size=config.lstm_pool_size,
+            stride=config.lstm_pool_stride,
+        )
+        self.flatten = nn.Flatten(start_dim=1)
+        self.norm = nn.LayerNorm(flatten_dim)
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        self.dense = nn.Linear(flatten_dim, config.hidden_size)
+        self.out_proj = nn.Linear(config.hidden_size, config.num_labels)
         self.lstm = nn.LSTM(
             input_size=config.hidden_size,
-            hidden_size=config.hidden_size // 2, #bidirectional LSTM should double the size, so this returns it
+            hidden_size=config.hidden_size // 2, #bidirectional LSTM should double the size, so this returns it. But I could probably also leave it as is and just double the size of the dense layer.
             num_layers=1,
             bias=True,
-            batch_first=True, #mostly cosmetic because I like (batch, seq, feature)
+            batch_first=True,
             bidirectional=True
         )
-        self.norm = nn.LayerNorm(config.hidden_size)
 
     def forward(self, features, **kwargs):
+        pooled_features = self.pre_lstm_pool(features.transpose(1, 2)).transpose(1, 2)
         # LSTM is numerically unstable in fp16 for long sequences — run in fp32
         with torch.amp.autocast("cuda", enabled=False):
-            lstm_out, (h_n, _) = self.lstm(features.float())  # lstm_out: (B, L, H)
-        # Pool: mean of all timesteps + final hidden states from both directions
-        # x_mean = lstm_out.mean(dim=1)                          # (B, H)
-        x_last = torch.cat([h_n[0], h_n[1]], dim=1)           # (B, H)
-        # x = torch.cat([x_mean, x_last], dim=1) ## or would x_mean + x_last also work? NO! that is adding, this is catting
-        x = x_last
+            lstm_out, _ = self.lstm(pooled_features.float())  # lstm_out: (B, L_reduced, H)
+        x = self.flatten(lstm_out.contiguous())
         x = self.norm(x)
         x = self.dropout(x)
         x = self.dense(x)
@@ -216,6 +234,9 @@ class ConvNetConfig(PretrainedConfig):
         n_aux_features=0,
         aux_features_vocab_size=5,
         conv_dropout_p=0.16,
+        seq_len=1000,
+        lstm_pool_size=4,
+        lstm_pool_stride=4,
         # for classification head:
         hidden_dropout_prob=0.4,
         hidden_act="gelu",
@@ -236,6 +257,9 @@ class ConvNetConfig(PretrainedConfig):
         self.aux_features_vocab_size = aux_features_vocab_size
         self.hidden_dropout_prob = hidden_dropout_prob
         self.conv_dropout_p = conv_dropout_p
+        self.seq_len = seq_len
+        self.lstm_pool_size = lstm_pool_size
+        self.lstm_pool_stride = lstm_pool_stride
         self.hidden_act = hidden_act
         self.regression_softplus = regression_softplus
 
