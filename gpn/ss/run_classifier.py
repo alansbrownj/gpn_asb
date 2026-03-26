@@ -21,6 +21,7 @@ import fcntl
 import logging
 import math
 import json
+import re
 import numpy as np
 import os
 import sys
@@ -31,6 +32,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import argparse
+import gc
 import time
 from typing import Any, Callable, Dict, List, NewType, Optional, Tuple, Union
 
@@ -340,11 +342,11 @@ class CustomTrainingArguments(TrainingArguments):
         metadata={"help": "Dropout probability for ConvLayer residual dropout."},
     )
     lstm_pool_size: int = field(
-        default=4,
+        default=16,
         metadata={"help": "MaxPool1d kernel size applied before the LSTM classification head."},
     )
     lstm_pool_stride: int = field(
-        default=4,
+        default=16,
         metadata={"help": "MaxPool1d stride applied before the LSTM classification head."},
     )
 
@@ -523,7 +525,6 @@ def main():
             self.hpo_peak_step = None
             self.hpo_final_eval_auprc = None
 
-        # [CODEX CHANGE 2026-02-27] Use trial-scoped TensorBoard directories.
         def _hp_search_setup(self, trial):
             super()._hp_search_setup(trial)
             if self.hp_search_backend is None or trial is None:
@@ -733,12 +734,13 @@ def main():
 
         return out
 
-    # [CODEX CHANGE 2026-02-27] Single-objective Optuna helper.
+    # optuna helper
     def _trial_objective_value(trial: optuna.trial.FrozenTrial) -> Optional[float]:
         if trial.values is None or len(trial.values) == 0:
             return None
         return trial.values[0]
 
+    # I had some problems with lstm stuff so adding this helper
     def _normalize_hpo_params(params: Dict[str, Any]) -> Dict[str, Any]:
         normalized = dict(params)
         pool_size = normalized.get("lstm_pool_size")
@@ -759,6 +761,11 @@ def main():
             'final_eval_auprc',
             'best_checkpoint',
             'retry_of_trial',
+            'failure_type',
+            'failure_stage',
+            'retry_attempted',
+            'retry_precision',
+            'retry_succeeded',
         ]
 
         with open(csv_path, 'w', newline='') as csv_file:
@@ -777,6 +784,11 @@ def main():
                     'final_eval_auprc': run_metrics['final_eval_auprc'],
                     'best_checkpoint': run_metrics['best_checkpoint'],
                     'retry_of_trial': trial.user_attrs.get('retry_of_trial', ''),
+                    'failure_type': trial.user_attrs.get('failure_type', ''),
+                    'failure_stage': trial.user_attrs.get('failure_stage', ''),
+                    'retry_attempted': trial.user_attrs.get('retry_attempted', False),
+                    'retry_precision': trial.user_attrs.get('retry_precision', ''),
+                    'retry_succeeded': trial.user_attrs.get('retry_succeeded', False),
                 }
                 writer.writerow(row)
 
@@ -789,35 +801,44 @@ def main():
                         json.dump(trial_summary, f, indent=2)
 
 
+    is_pretrained_run = (
+        model_args.model_name_or_path is not None
+        and str(model_args.model_name_or_path).lower() != "none"
+    )
+
+    ## Main optuna hyperparameter space args
     def hp_space(trial):
         lstm_pool_size = trial.suggest_categorical("lstm_pool_size", [2, 4, 8, 16])
         lstm_pool_stride = lstm_pool_size // trial.suggest_categorical(
             "lstm_pool_stride_divisor", [1, 2]
         )
+        # Pretrained checkpoints are notably less stable in fp16 at step 0, so
+        # constrain the riskiest dimensions while preserving useful exploration.
+        hidden_dropout_upper = 0.45 if is_pretrained_run else 0.7
+        conv_dropout_upper = 0.45 if is_pretrained_run else 0.7
+        lr_upper = 3e-5 if is_pretrained_run else 1e-3
         return {
-            "hidden_dropout_prob": trial.suggest_float("hidden_dropout_prob", 0.0, 0.7),
-            "conv_dropout_p": trial.suggest_float("conv_dropout_p", 0.0, 0.7),
-            "learning_rate": trial.suggest_float("learning_rate", 1e-6, 1e-3, log=True),
+            "hidden_dropout_prob": trial.suggest_float("hidden_dropout_prob", 0.0, hidden_dropout_upper),
+            "conv_dropout_p": trial.suggest_float("conv_dropout_p", 0.0, conv_dropout_upper),
+            "learning_rate": trial.suggest_float("learning_rate", 1e-6, lr_upper, log=True),
             "lstm_pool_size": lstm_pool_size,
             "lstm_pool_stride": lstm_pool_stride,
             # "lr_scheduler_type": trial.suggest_categorical(
             #     "lr_scheduler_type", ["cosine", "linear", "constant"]
             # ),
-            "warmup_steps": 0,
-            "warmup_ratio": 0.0,
-            "use_cyclic_lr": False,
+            # "warmup_steps": 0,
+            # "warmup_ratio": 0.0,
+            # "use_cyclic_lr": False,
         }
 
     # choose *one* metric to optimise for hyperparameter search
     def objective(metrics: Dict[str, float]) -> float:
-        # [CODEX CHANGE 2026-02-27] Old behavior kept for reference:
         # return metrics["eval_auprc"]
         # New behavior: optimize peak eval_auprc observed during the trial.
         if "eval_auprc_peak" in metrics:
             return metrics["eval_auprc_peak"]
         return metrics["eval_auprc"]
 
-    # [CODEX CHANGE 2026-02-27] Normalize output path so run-*/tb/trial_summary paths are stable.
     hpo_output_dir = os.path.abspath(training_args.output_dir)
     training_args.output_dir = hpo_output_dir
     os.makedirs(training_args.output_dir, exist_ok=True)
@@ -832,8 +853,11 @@ def main():
     fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     optuna.logging.get_logger("optuna").addHandler(fh)
 
+    # Adding this to catch some errors I ran into
     def _is_known_numerical_failure(exc: Exception) -> bool:
         if isinstance(exc, (NumericalTrialFailure, FloatingPointError)):
+            return True
+        if isinstance(exc, torch.cuda.OutOfMemoryError):
             return True
         if isinstance(exc, ValueError):
             message = str(exc).lower()
@@ -842,6 +866,52 @@ def main():
             if "not finite" in message or "non-finite" in message:
                 return True
         return False
+
+    def _extract_global_step_from_message(message: str) -> Optional[int]:
+        match = re.search(r"global_step=(\d+)", str(message))
+        if match is None:
+            return None
+        return int(match.group(1))
+
+    # label and log errors for debugging
+    def _failure_taxonomy(exc: Exception) -> Dict[str, Any]:
+        message = str(exc)
+        lower = message.lower()
+        failure_stage = "unknown"
+        global_step = _extract_global_step_from_message(message)
+        if global_step is not None:
+            failure_stage = "step0" if global_step == 0 else "post_step0"
+
+        if isinstance(exc, torch.cuda.OutOfMemoryError):
+            failure_type = "cuda_oom"
+        elif "non-finite logits" in lower:
+            failure_type = "nonfinite_logits"
+        elif "non-finite loss" in lower:
+            failure_type = "nonfinite_loss"
+        elif "non-finite probabilities" in lower:
+            failure_type = "nonfinite_probabilities"
+        elif "non-finite" in lower or "not finite" in lower or "nan" in lower or "infinity" in lower:
+            failure_type = "nonfinite_other"
+        else:
+            failure_type = "unknown"
+
+        return {
+            "failure_reason": message[:2000],
+            "failure_stage": failure_stage,
+            "failure_type": failure_type,
+            "global_step": global_step,
+        }
+
+    # I had some problems with bf16 stuff so adding this helper for a restart strategy
+    def _retry_precision_args(run_args):
+        bf16_supported = bool(torch.cuda.is_available() and torch.cuda.is_bf16_supported())
+        return replace(
+            run_args,
+            fp16=False,
+            fp16_full_eval=False,
+            bf16=bf16_supported,
+            bf16_full_eval=bf16_supported,
+        ), ("bf16" if bf16_supported else "fp32")
 
     def _build_trainer(run_args):
         trainer_holder: Dict[str, BalancedTrainer] = {}
@@ -940,6 +1010,7 @@ def main():
         except Exception:
             pass
         if torch.cuda.is_available():
+            gc.collect()
             torch.cuda.empty_cache()
 
     def _create_or_load_study(study_name: str, storage: str) -> optuna.Study:
@@ -1028,6 +1099,9 @@ def main():
             claimed_trials += 1
             trainer = None
             try:
+                retry_attempted = False
+                retry_succeeded = False
+                retry_precision = ""
                 trainer = _build_trainer(replace(base_training_args))
                 trainer.hp_search_backend = HPSearchBackend.OPTUNA
                 trainer.hp_space = hp_space
@@ -1048,6 +1122,10 @@ def main():
                         f"Trial {trial.number} produced non-finite objective {objective_value}."
                     )
 
+                trial.set_user_attr("trial_outcome", "COMPLETE")
+                trial.set_user_attr("retry_attempted", retry_attempted)
+                trial.set_user_attr("retry_succeeded", retry_succeeded)
+                trial.set_user_attr("retry_precision", retry_precision)
                 study.tell(trial, objective_value, state=TrialState.COMPLETE)
                 completed_trials += 1
                 logger.info(
@@ -1073,8 +1151,86 @@ def main():
                 )
             except Exception as exc:
                 if trial is not None and _is_known_numerical_failure(exc):
+                    failure = _failure_taxonomy(exc)
+                    retry_attempted = False
+                    retry_succeeded = False
+                    retry_precision = ""
+
+                    if (
+                        is_pretrained_run
+                        and base_training_args.fp16
+                        and failure["failure_stage"] == "step0"
+                    ):
+                        retry_attempted = True
+                        retry_args, retry_precision = _retry_precision_args(replace(base_training_args))
+                        trial.set_user_attr("retry_attempted", retry_attempted)
+                        trial.set_user_attr("retry_precision", retry_precision)
+                        trial.set_user_attr("initial_failure_reason", failure["failure_reason"])
+                        trial.set_user_attr("failure_stage", failure["failure_stage"])
+                        trial.set_user_attr("failure_type", failure["failure_type"])
+
+                        logger.info(
+                            "Worker %s/%s retrying trial %s after %s with precision=%s",
+                            model_args.hpo_worker_index,
+                            model_args.hpo_worker_count,
+                            trial.number,
+                            failure["failure_type"],
+                            retry_precision,
+                        )
+                        try:
+                            trainer = _build_trainer(retry_args)
+                            trainer.hp_search_backend = HPSearchBackend.OPTUNA
+                            trainer.hp_space = hp_space
+                            trainer.compute_objective = objective
+                            trainer.objective = None
+
+                            trainer.train(resume_from_checkpoint=None, trial=trial)
+                            if getattr(trainer, "objective", None) is None:
+                                metrics = trainer.evaluate()
+                                trainer.objective = trainer.compute_objective(metrics)
+
+                            if trainer.objective is None:
+                                raise NumericalTrialFailure(
+                                    f"Trial {trial.number} did not produce an objective value on retry."
+                                )
+
+                            objective_value = float(trainer.objective)
+                            if not math.isfinite(objective_value):
+                                raise NumericalTrialFailure(
+                                    f"Trial {trial.number} produced non-finite objective {objective_value} on retry."
+                                )
+
+                            retry_succeeded = True
+                            trial.set_user_attr("trial_outcome", "COMPLETE")
+                            trial.set_user_attr("retry_attempted", retry_attempted)
+                            trial.set_user_attr("retry_succeeded", retry_succeeded)
+                            trial.set_user_attr("retry_precision", retry_precision)
+                            study.tell(trial, objective_value, state=TrialState.COMPLETE)
+                            completed_trials += 1
+                            logger.info(
+                                "Worker %s/%s recovered trial %s objective=%s with retry precision=%s params=%s",
+                                model_args.hpo_worker_index,
+                                model_args.hpo_worker_count,
+                                trial.number,
+                                objective_value,
+                                retry_precision,
+                                _normalize_hpo_params(trial.params),
+                            )
+                            continue
+                        except Exception as retry_exc:
+                            if not _is_known_numerical_failure(retry_exc):
+                                raise
+                            failure = _failure_taxonomy(retry_exc)
+                            trial.set_user_attr("retry_succeeded", retry_succeeded)
+
                     trial.set_user_attr("trial_outcome", "FAIL")
-                    trial.set_user_attr("failure_reason", str(exc)[:2000])
+                    trial.set_user_attr("failure_reason", failure["failure_reason"])
+                    trial.set_user_attr("failure_stage", failure["failure_stage"])
+                    trial.set_user_attr("failure_type", failure["failure_type"])
+                    trial.set_user_attr("retry_attempted", retry_attempted)
+                    trial.set_user_attr("retry_succeeded", retry_succeeded)
+                    if retry_precision:
+                        trial.set_user_attr("retry_precision", retry_precision)
                     study.tell(trial, state=TrialState.FAIL)
                     failed_trials += 1
                     logger.warning(

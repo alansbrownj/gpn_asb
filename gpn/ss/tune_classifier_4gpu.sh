@@ -2,28 +2,29 @@
 #SBATCH --time=8-00:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=24
-#SBATCH --gres=gpu:3
+#SBATCH --cpus-per-task=12
+#SBATCH --gres=gpu:2
 #SBATCH --mem=188GB
-#SBATCH --job-name=TuneClassifier3GPU
+#SBATCH --job-name=TuneClassifier2GPU
 #SBATCH --output=slurm-%x-%j.out
 
 # To use N GPUs: set NUM_GPUS=N below and set --gres=gpu:N and --job-name above to match.
 
-NUM_GPUS=${NUM_GPUS:-3}
+NUM_GPUS=${NUM_GPUS:-2}
 
 # Multi-GPU Optuna launcher that continues an existing study.
 # Each worker claims one trial at a time from the shared Optuna study so idle
 # GPUs can keep pulling new work until the global trial budget is exhausted.
 # When changing NUM_GPUS (e.g. to 3), also set --gres=gpu:N and --job-name=TuneClassifierNGPU above.
 
-set -o pipefail
-umask 007
-
+# activate my conda environment
 date +"%F W%V.%u %T"
 source ~/anaconda3/etc/profile.d/conda.sh
 export MKL_INTERFACE_LAYER="${MKL_INTERFACE_LAYER-}"
 conda activate deep
+
+# some error handling
+umask 007
 set -euo pipefail
 
 # Positional args:
@@ -67,6 +68,8 @@ cd /home/asb5975/group/lab/alan/deep_learning_sequence_prediction
 export PYTHONPATH="/home/asb5975/group/lab/alan/deep_learning_sequence_prediction/gpn_asb:${PYTHONPATH:-}"
 
 echo "Bootstrapping Optuna study (create/load once)"
+# https://optuna.readthedocs.io/en/stable/reference/generated/optuna.study.create_study.html#optuna.study.create_study
+
 python - <<PY
 import optuna
 optuna.create_study(
@@ -106,12 +109,14 @@ for worker_idx in $(seq 0 $((NUM_GPUS-1))); do
         --metric_for_best_model auprc --greater_is_better True \
         --optim adamw_torch --weight_decay 0.01 \
         --hyperparameter_search True \
-        --train_best_after_search False \
+        --warmup_steps 600 \
+        --train_best_after_search True \
         --hpo_total_trials "$total_trials" \
         --hpo_worker_count "$NUM_GPUS" \
         --hpo_worker_index "$worker_idx" \
         --hpo_study_name "$study_name" \
         --hpo_storage "$storage_url" \
+        --use_cyclic_lr False \
         > "$out_dir/worker${worker_idx}.log" 2>&1 &
     pids+=("$!")
     sleep 2
