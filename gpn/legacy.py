@@ -167,6 +167,17 @@ class LSTMClassificationHead(nn.Module):
             bidirectional=True
         )
 
+        for name, param in self.lstm.named_parameters():
+            if "weight_ih" in name:
+                nn.init.xavier_uniform_(param.data)
+            elif "weight_hh" in name:
+                nn.init.orthogonal_(param.data)
+            elif "bias" in name:
+                param.data.zero_()
+        # initialize the output projection layer to zero to prevent explosion early on. 
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
+
     def forward(self, features, **kwargs):
         pooled_features = self.pre_lstm_pool(features.transpose(1, 2)).transpose(1, 2)
         # LSTM is numerically unstable in fp16 for long sequences — run in fp32

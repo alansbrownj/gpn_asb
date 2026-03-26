@@ -136,5 +136,9 @@ dmypy.json
 
 # Others
 results/
+examples/ss/test_run_for_printing/
+examples/ss/slurm*.out
 
 .snakemake/
+gpn/.vscode/
+gpn/.cursor/
