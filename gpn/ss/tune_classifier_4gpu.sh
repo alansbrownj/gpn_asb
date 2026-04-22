@@ -3,14 +3,14 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=12
-#SBATCH --gres=gpu:2
+#SBATCH --gres=gpu:4
 #SBATCH --mem=188GB
-#SBATCH --job-name=TuneClassifier2GPU
+#SBATCH --job-name=TuneClassifier4GPU
 #SBATCH --output=slurm-%x-%j.out
 
 # To use N GPUs: set NUM_GPUS=N below and set --gres=gpu:N and --job-name above to match.
 
-NUM_GPUS=${NUM_GPUS:-2}
+NUM_GPUS=${NUM_GPUS:-4}
 
 # Multi-GPU Optuna launcher that continues an existing study.
 # Each worker claims one trial at a time from the shared Optuna study so idle

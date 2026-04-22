@@ -420,12 +420,29 @@ def main():
         )
         return cfg, model
 
+    train_pos_path = os.path.join(data_args.datadir, "train_positives.parquet")
+    train_neg_path = os.path.join(data_args.datadir, "train_negatives.parquet")
+    val_pos_path = os.path.join(data_args.datadir, "val_positives.parquet")
+    val_neg_path = os.path.join(data_args.datadir, "val_negatives.parquet")
+    diag_val_pos_path = os.path.join(data_args.datadir, "val_trainlike_positives.parquet")
+    diag_val_neg_path = os.path.join(data_args.datadir, "val_trainlike_negatives.parquet")
+
+    logger.info("Loading classifier parquet datasets from %s", data_args.datadir)
+    logger.info("Training parquet files: %s ; %s", train_pos_path, train_neg_path)
+    logger.info("Validation parquet files used for checkpoint selection/HPO: %s ; %s", val_pos_path, val_neg_path)
+    if os.path.exists(diag_val_pos_path) and os.path.exists(diag_val_neg_path):
+        logger.info(
+            "Detected diagnostic train-like validation files at %s and %s; they are not used for checkpoint selection or HPO.",
+            diag_val_pos_path,
+            diag_val_neg_path,
+        )
+
     # Load the positive and negative datasets for training
     pos_dataset = ParquetClassificationDataset(
-        f"{data_args.datadir}/train_positives.parquet", tokenizer, max_length=data_args.max_seq_length
+        train_pos_path, tokenizer, max_length=data_args.max_seq_length
     )
     neg_dataset = ParquetClassificationDataset(
-        f"{data_args.datadir}/train_negatives.parquet", tokenizer, max_length=data_args.max_seq_length
+        train_neg_path, tokenizer, max_length=data_args.max_seq_length
     )
 
     ## Going to try weighting the loss of the positives. 
@@ -443,10 +460,10 @@ def main():
 
     # VALIDATION DATA
     val_pos_dataset = ParquetClassificationDataset(
-        f"{data_args.datadir}/val_positives.parquet", tokenizer, max_length=data_args.max_seq_length
+        val_pos_path, tokenizer, max_length=data_args.max_seq_length
     )
     val_neg_dataset = ParquetClassificationDataset(
-        f"{data_args.datadir}/val_negatives.parquet", tokenizer, max_length=data_args.max_seq_length
+        val_neg_path, tokenizer, max_length=data_args.max_seq_length
     )
     val_dataset = ConcatDataset([val_pos_dataset, val_neg_dataset])
 
@@ -485,6 +502,8 @@ def main():
         )
     for split, ds in split_datasets:
         print(split, ds.df["label"].value_counts(), flush=True)
+        if "type" in ds.df.columns:
+            print(f"{split}_types", ds.df["type"].value_counts(), flush=True)
 
     # Estimate steps per epoch (optimizer steps), accounting for grad accumulation and DDP
     world_size = max(1, training_args.world_size)  # number of processes
@@ -982,7 +1001,7 @@ def main():
             )
             _, model = _build_model_with_runtime_config(run_args)
             return model
-
+        # https://huggingface.co/docs/transformers/en/main_classes/callback callbacks takes a list of callbacks
         trainer = BalancedTrainer(
             model_init=model_init,
             args=run_args,
@@ -992,6 +1011,7 @@ def main():
             compute_metrics=compute_metrics,
             train_sample_weights=train_sample_weights,
             test_dataset=test_dataset,
+            callbacks=[EarlyStoppingCallback(early_stopping_patience=6)],
         )
         trainer_holder["trainer"] = trainer
         return trainer
@@ -1020,7 +1040,7 @@ def main():
             storage=storage,
             load_if_exists=True,
             pruner=HyperbandPruner(
-                min_resource=max(1, steps_per_epoch),
+                min_resource=max(1, steps_per_epoch // 2),
                 max_resource="auto",
                 reduction_factor=2,
             ),
