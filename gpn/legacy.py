@@ -125,6 +125,25 @@ class ClassificationHead(nn.Module):
         x = self.out_proj(x)
         return x
 
+class ClassificationHead_mean_pooling(nn.Module):
+    """Head for sentence-level classification tasks."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        self.out_proj = nn.Linear(config.hidden_size, config.num_labels)
+
+        self.config = config
+
+    def forward(self, features, **kwargs):
+        x = features.mean(axis=1)  # mean pooling
+        x = self.dropout(x)
+        x = self.dense(x)
+        x = ACT2FN[self.config.hidden_act](x)
+        x = self.dropout(x)
+        x = self.out_proj(x)
+        return x
 
 class LSTMClassificationHead(nn.Module):
     """Head for sentence-level classification tasks."""
@@ -369,8 +388,15 @@ class ConvNetForSequenceClassification(ConvNetPreTrainedModel):
         super().__init__(config)
         self.num_labels = config.num_labels
         self.model = ConvNetModel(config)
-        # self.classifier = ClassificationHead(config)  # original mean+max pooling head
-        self.classifier = LSTMClassificationHead(config)
+        head = getattr(config, "classification_head", "lstm")
+        if head == "mean_pooling":
+            self.classifier = ClassificationHead_mean_pooling(config)
+        elif head == "lstm":
+            self.classifier = LSTMClassificationHead(config)
+        else:
+            raise ValueError(
+                f"Unknown classification_head={head!r}; expected 'lstm' or 'mean_pooling'"
+            )
         self.regression_softplus = config.regression_softplus
 
         # Initialize weights and apply final processing

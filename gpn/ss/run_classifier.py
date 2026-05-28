@@ -75,7 +75,7 @@ from scipy.stats import geom
 from torch.utils.data import ConcatDataset, WeightedRandomSampler, Dataset
 from tqdm import tqdm
 
-## These imports are *mostly* the same as the run_mlm.py script. 
+## These imports are *mostly* the same as the run_mlm.py script.
 # help(TrainingArguments)
 
 print("Python version:", sys.version)
@@ -89,6 +89,155 @@ logging.basicConfig(
 
 class NumericalTrialFailure(RuntimeError):
     """Raised when a trial produces non-finite tensors or metrics."""
+
+
+class BalancedTrainer(transformers.Trainer):
+    """Class-balanced Trainer with CyclicLR support and numerical-failure detection."""
+
+    def __init__(self, *args, train_sample_weights=None, test_dataset=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.train_sample_weights = train_sample_weights
+        self.test_dataset = test_dataset
+        self.hpo_peak_eval_auprc = None
+        self.hpo_peak_step = None
+        self.hpo_final_eval_auprc = None
+
+    def _hp_search_setup(self, trial):
+        super()._hp_search_setup(trial)
+        if self.hp_search_backend is None or trial is None:
+            return
+        trial_number = getattr(trial, 'number', None)
+        if trial_number is None:
+            return
+
+        for callback in self.callback_handler.callbacks:
+            if hasattr(callback, 'tb_writer') and callback.tb_writer is not None:
+                try:
+                    callback.tb_writer.close()
+                except Exception:
+                    pass
+                callback.tb_writer = None
+
+        run_dir = os.path.join(self.args.output_dir, f'run-{trial_number}')
+        tb_dir = os.path.join(run_dir, 'tb')
+        os.makedirs(tb_dir, exist_ok=True)
+        self.args.logging_dir = tb_dir
+        self.hpo_peak_eval_auprc = None
+        self.hpo_peak_step = None
+        self.hpo_final_eval_auprc = None
+        logger.info('HPO trial %s TensorBoard log dir: %s', trial_number, tb_dir)
+
+    @staticmethod
+    def _tensor_debug_summary(tensor: Optional[Union[torch.Tensor, np.ndarray]]) -> str:
+        if tensor is None:
+            return 'n/a'
+        data = torch.as_tensor(tensor).detach().float().cpu()
+        finite = data[torch.isfinite(data)]
+        min_value = float(finite.min().item()) if finite.numel() else None
+        max_value = float(finite.max().item()) if finite.numel() else None
+        return (
+            f"shape={tuple(data.shape)} finite={int(finite.numel())}/{data.numel()} "
+            f"min={min_value} max={max_value}"
+        )
+
+    def _current_learning_rate(self) -> float:
+        try:
+            learning_rate = self._get_learning_rate()
+            if learning_rate is not None:
+                return float(learning_rate)
+        except Exception:
+            pass
+        return float(self.args.learning_rate)
+
+    def _raise_numerical_failure(self, reason: str, *, logits=None, probs=None, loss=None):
+        trial = getattr(self, '_trial', None)
+        trial_number = getattr(trial, 'number', 'n/a')
+        message = (
+            f"Trial {trial_number} numerical failure: {reason}; "
+            f"global_step={int(self.state.global_step)}; "
+            f"learning_rate={self._current_learning_rate()}; "
+            f"hidden_dropout_prob={self.args.hidden_dropout_prob}; "
+            f"conv_dropout_p={self.args.conv_dropout_p}; "
+            f"logits={self._tensor_debug_summary(logits)}; "
+            f"probs={self._tensor_debug_summary(probs)}; "
+            f"loss={self._tensor_debug_summary(loss)}"
+        )
+        logger.error(message)
+        raise NumericalTrialFailure(message)
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None, **kwargs):
+        labels = inputs["labels"]
+        outputs = model(**{k: v for k, v in inputs.items() if k != "labels"})
+        logits = outputs.logits
+        if not torch.isfinite(logits).all():
+            self._raise_numerical_failure("non-finite logits during training", logits=logits)
+        loss = F.cross_entropy(logits, labels)
+        if not torch.isfinite(loss).all():
+            self._raise_numerical_failure("non-finite loss during training", logits=logits, loss=loss)
+        return (loss, outputs) if return_outputs else loss
+
+    def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
+        if self.args.world_size > 1:
+            return super()._get_train_sampler()
+        if self.train_sample_weights is None:
+            return super()._get_train_sampler()
+        return WeightedRandomSampler(
+            self.train_sample_weights,
+            num_samples=len(self.train_sample_weights),
+            replacement=True,
+        )
+
+    def create_scheduler(self, num_training_steps: int, optimizer=None):
+        if getattr(self.args, "use_cyclic_lr", False):
+            opt = optimizer if optimizer is not None else self.optimizer
+            if opt is None:
+                raise ValueError("Optimizer must be set before creating the scheduler.")
+            self.lr_scheduler = torch.optim.lr_scheduler.CyclicLR(
+                opt,
+                base_lr=self.args.base_lr,
+                max_lr=self.args.max_lr,
+                step_size_up=self.args.cycle_steps_up,
+                step_size_down=self.args.cycle_steps_down or self.args.cycle_steps_up,
+                mode=self.args.cycle_mode,
+                gamma=self.args.cycle_gamma,
+                cycle_momentum=False,
+            )
+            self._created_lr_scheduler = True
+            return self.lr_scheduler
+        return super().create_scheduler(num_training_steps, optimizer)
+
+    def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
+        eval_metrics = super().evaluate(
+            eval_dataset=eval_dataset,
+            ignore_keys=ignore_keys,
+            metric_key_prefix=metric_key_prefix,
+        )
+        if metric_key_prefix == "train":
+            return eval_metrics
+
+        if metric_key_prefix == "eval":
+            eval_auprc = eval_metrics.get("eval_auprc")
+            if eval_auprc is not None:
+                self.hpo_final_eval_auprc = float(eval_auprc)
+                if self.hpo_peak_eval_auprc is None or eval_auprc > self.hpo_peak_eval_auprc:
+                    self.hpo_peak_eval_auprc = float(eval_auprc)
+                    self.hpo_peak_step = int(self.state.global_step)
+                eval_metrics["eval_auprc_peak"] = self.hpo_peak_eval_auprc
+                eval_metrics["eval_auprc_peak_step"] = float(self.hpo_peak_step)
+                eval_metrics["eval_auprc_final"] = self.hpo_final_eval_auprc
+
+        if metric_key_prefix == "eval" and self.test_dataset is not None:
+            test_metrics = self.predict(
+                self.test_dataset,
+                ignore_keys=ignore_keys,
+                metric_key_prefix="test",
+            ).metrics
+            test_auprc = test_metrics.get("test_auprc")
+            if test_auprc is not None:
+                self.log({"test_auprc": test_auprc})
+                eval_metrics["test_auprc"] = test_auprc
+
+        return eval_metrics
 
 class ParquetClassificationDataset(Dataset):
     def __init__(self, parquet_file: str, tokenizer, max_length: int = 512):
@@ -534,165 +683,7 @@ def main():
         inv_class_weights.tolist(),
     )
 
-    class BalancedTrainer(transformers.Trainer):
-        def __init__(self, *args, train_sample_weights=None, test_dataset=None, **kwargs):
-            super().__init__(*args, **kwargs)
-            self.train_sample_weights = train_sample_weights
-            self.test_dataset = test_dataset
-            # [CODEX CHANGE 2026-02-27] Track per-trial peak/final eval AUPRC for HPO objective reporting.
-            self.hpo_peak_eval_auprc = None
-            self.hpo_peak_step = None
-            self.hpo_final_eval_auprc = None
-
-        def _hp_search_setup(self, trial):
-            super()._hp_search_setup(trial)
-            if self.hp_search_backend is None or trial is None:
-                return
-            trial_number = getattr(trial, 'number', None)
-            if trial_number is None:
-                return
-
-            # Close previous TensorBoard writer so the next trial uses its own log dir.
-            for callback in self.callback_handler.callbacks:
-                if hasattr(callback, 'tb_writer') and callback.tb_writer is not None:
-                    try:
-                        callback.tb_writer.close()
-                    except Exception:
-                        pass
-                    callback.tb_writer = None
-
-            run_dir = os.path.join(self.args.output_dir, f'run-{trial_number}')
-            tb_dir = os.path.join(run_dir, 'tb')
-            os.makedirs(tb_dir, exist_ok=True)
-            self.args.logging_dir = tb_dir
-            self.hpo_peak_eval_auprc = None
-            self.hpo_peak_step = None
-            self.hpo_final_eval_auprc = None
-            logger.info('HPO trial %s TensorBoard log dir: %s', trial_number, tb_dir)
-
-        @staticmethod
-        def _tensor_debug_summary(tensor: Optional[Union[torch.Tensor, np.ndarray]]) -> str:
-            if tensor is None:
-                return 'n/a'
-            data = torch.as_tensor(tensor).detach().float().cpu()
-            finite = data[torch.isfinite(data)]
-            min_value = float(finite.min().item()) if finite.numel() else None
-            max_value = float(finite.max().item()) if finite.numel() else None
-            return (
-                f"shape={tuple(data.shape)} finite={int(finite.numel())}/{data.numel()} "
-                f"min={min_value} max={max_value}"
-            )
-
-        def _current_learning_rate(self) -> float:
-            try:
-                learning_rate = self._get_learning_rate()
-                if learning_rate is not None:
-                    return float(learning_rate)
-            except Exception:
-                pass
-            return float(self.args.learning_rate)
-
-        def _raise_numerical_failure(self, reason: str, *, logits=None, probs=None, loss=None):
-            trial = getattr(self, '_trial', None)
-            trial_number = getattr(trial, 'number', 'n/a')
-            message = (
-                f"Trial {trial_number} numerical failure: {reason}; "
-                f"global_step={int(self.state.global_step)}; "
-                f"learning_rate={self._current_learning_rate()}; "
-                f"hidden_dropout_prob={self.args.hidden_dropout_prob}; "
-                f"conv_dropout_p={self.args.conv_dropout_p}; "
-                f"logits={self._tensor_debug_summary(logits)}; "
-                f"probs={self._tensor_debug_summary(probs)}; "
-                f"loss={self._tensor_debug_summary(loss)}"
-            )
-            logger.error(message)
-            raise NumericalTrialFailure(message)
-
-        def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None, **kwargs):
-            labels = inputs["labels"]
-            outputs = model(**{k: v for k, v in inputs.items() if k != "labels"})
-            logits = outputs.logits
-            if not torch.isfinite(logits).all():
-                self._raise_numerical_failure("non-finite logits during training", logits=logits)
-            loss = F.cross_entropy(logits, labels)
-            if not torch.isfinite(loss).all():
-                self._raise_numerical_failure("non-finite loss during training", logits=logits, loss=loss)
-            return (loss, outputs) if return_outputs else loss
-
-        def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
-            if self.args.world_size > 1:
-                return super()._get_train_sampler()
-            if self.train_sample_weights is None:
-                return super()._get_train_sampler()
-            return WeightedRandomSampler(
-                self.train_sample_weights,
-                num_samples=len(self.train_sample_weights),
-                replacement=True,
-            )
-
-        def create_scheduler(self, num_training_steps: int, optimizer=None):
-            """
-            Override to allow a CyclicLR schedule when requested; otherwise fall
-            back to the HF default scheduler creation.
-            """
-            if getattr(self.args, "use_cyclic_lr", False):
-                opt = optimizer if optimizer is not None else self.optimizer
-                if opt is None:
-                    raise ValueError("Optimizer must be set before creating the scheduler.")
-                self.lr_scheduler = torch.optim.lr_scheduler.CyclicLR(
-                    opt,
-                    base_lr=self.args.base_lr,
-                    max_lr=self.args.max_lr,
-                    step_size_up=self.args.cycle_steps_up,
-                    step_size_down=self.args.cycle_steps_down or self.args.cycle_steps_up,
-                    mode=self.args.cycle_mode,
-                    gamma=self.args.cycle_gamma,
-                    cycle_momentum=False,  # AdamW/Adafactor do not use momentum buffers here
-                )
-                self._created_lr_scheduler = True
-                return self.lr_scheduler
-            return super().create_scheduler(num_training_steps, optimizer)
-
-        def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
-            """
-            Keep standard evaluation behavior, and additionally compute/log
-            train auPRC with the same compute_metrics logic used for eval.
-            """
-            eval_metrics = super().evaluate(
-                eval_dataset=eval_dataset,
-                ignore_keys=ignore_keys,
-                metric_key_prefix=metric_key_prefix,
-            )
-
-            # Avoid recursion if someone explicitly runs a train-prefixed evaluate.
-            if metric_key_prefix == "train":
-                return eval_metrics
-
-            # [CODEX CHANGE 2026-02-27] Track running peak eval_auprc and expose it to Optuna objective.
-            if metric_key_prefix == "eval":
-                eval_auprc = eval_metrics.get("eval_auprc")
-                if eval_auprc is not None:
-                    self.hpo_final_eval_auprc = float(eval_auprc)
-                    if self.hpo_peak_eval_auprc is None or eval_auprc > self.hpo_peak_eval_auprc:
-                        self.hpo_peak_eval_auprc = float(eval_auprc)
-                        self.hpo_peak_step = int(self.state.global_step)
-                    eval_metrics["eval_auprc_peak"] = self.hpo_peak_eval_auprc
-                    eval_metrics["eval_auprc_peak_step"] = float(self.hpo_peak_step)
-                    eval_metrics["eval_auprc_final"] = self.hpo_final_eval_auprc
-
-            if metric_key_prefix == "eval" and self.test_dataset is not None:
-                test_metrics = self.predict(
-                    self.test_dataset,
-                    ignore_keys=ignore_keys,
-                    metric_key_prefix="test",
-                ).metrics
-                test_auprc = test_metrics.get("test_auprc")
-                if test_auprc is not None:
-                    self.log({"test_auprc": test_auprc})
-                    eval_metrics["test_auprc"] = test_auprc
-
-            return eval_metrics
-
+    # BalancedTrainer is defined at module level above so external drivers can import it.
 
     # [CODEX CHANGE 2026-02-27] Helpers for study-level reporting and per-trial summaries.
     def _checkpoint_step_from_path(path_value: Optional[str]) -> Optional[int]:
